@@ -61,8 +61,8 @@
 | `0x06` | PendingUpdate | `ready:u16`, `unready:u16`（相手の予告ゲージ表示用・フェーズ別。ready=確定/降下可段, unready=猶予段。いずれも internal 非表示段は除外） |
 | `0x07` | GameOver | `result:u8`（0=topout/負, 1=clear/勝） |
 | `0x08` | **Control（開始/再戦合意・ルール変更）** | `action:u8`, `seed:u32`。`action`=`0x01 READY`（開始/再戦の準備完了。`seed`=共有シード素材）/`0x02 UNREADY`（準備取消・`seed` 未使用）/`0x03 RULE`（在室中のルール変更通知。`seed`=ルールコード `0=tet` / `1=puyo`） |
-| `0x09` | LockChain（ぷよ連鎖起点盤面） | `board:u8×102`（ぷよ盤面 §5）。**ぷよ専用**。連鎖判定の直前＝操作ぷよ確定盤面（`fixWait5f→checkErase` 遷移）を 1 回送る。受信側パペットはこの盤面から連鎖を**自前で再生**（実 PuyoGame の連鎖状態機械を駆動＝点滅/連鎖文字/落下/連鎖SEを完全再現） |
-| `0x0a` | SE（離散SE発音同期） | `seId:u8`（`1`=puyo_fix）。盤面イベントから独立して「この音を今鳴らす」を相手へ送る。発音タイミングが盤面スナップショット（Lock/LockChain＝固定アニメ後で遅れる）とずれる音に使う。ぷよ設置音はペア着地（`_fixPuyo`/split 着地）の瞬間に送り、受信側は即 `playSe` |
+| `0x09` | LockChain（ぷよ連鎖起点盤面） | `board:u8×102`（ぷよ盤面 §5）。**ぷよ専用**。連鎖判定の直前＝操作ぷよ確定盤面を `chainCount===0`（連鎖開始前）の **`_beginFixAnimWait`（固定振動の開始）**で 1 回送る。受信側パペットはこの盤面から連鎖を**自前で再生**（実 PuyoGame の連鎖状態機械を駆動＝点滅/連鎖文字/落下/連鎖SEを完全再現）。受信時は旧盤面との差分で「今置かれたぷよ」を拾い、固定振動(`_addPuyoAnim`＋fixAnim)を1回挟んでから連鎖判定に入る＝ローカルと同じ「固定→振動→消去」順を再現 |
+| `0x0a` | SE（離散SE発音同期） | `seId:u8`（`1`=puyo_fix / `2`=puyo_drop）。盤面イベントから独立して「この音を今鳴らす」を相手へ送る。発音タイミングが盤面スナップショット（Lock/LockChain）とずれる音に使う。通常設置音はペア着地（`_fixPuyo`/split 着地）で `puyo_fix` を、クイックドロップ設置音は `_tryQuickDrop` で `puyo_drop` を送り、受信側は即 `playSe` |
 
 > **表示同期 vs ゲーム影響**: `0x04 GarbageSend` のみ受信側の自分のゲームに反映（予告に積む。相殺/着弾は受信側の既存ロジック）。他はすべて相手ミニ盤面への描画のみで自分のゲームに影響しない。
 
@@ -72,7 +72,7 @@
 
 > **LockChain（`0x09`）= ぷよ連鎖をクライアント側で全再生**: パペットは実 PuyoGame インスタンスなので、連鎖前の確定盤面を渡してその連鎖状態機械（`checkErase→erasing→eraseWait→dropping`）を rAF で駆動すれば、点滅・連鎖文字・落下・連鎖SE が完全再現される。攻撃送信系は `isVersusMode=false` で全て無効化されるため副作用なし。受信側は「消せる組が無い `checkErase`」を検出して停止し、その先の おじゃま降下/次ツモ生成（盤面外ロジック）には踏み込まない。連鎖後＋おじゃま込みの確定盤面は通常の Lock（`0x02`）が補正として届く（再生中なら終了まで適用を保留）。テトのライン消去演出は対象外（盤面 Lock のみ）。
 
-> **ぷよ設置音は SE（`0x0a`）で同期**: 旧版は LockChain/Lock 到着時に `puyo_fix` を鳴らしていたが、これらは固定アニメ後（`fixWait5f`）のため**実際の着地より遅れる**（連鎖の無い設置では旧 Lock タイミングと体感差が出ない）。設置音は `_fixPuyo`／split 着地の `playSe('puyo_fix')` と同じ瞬間に `SE{seId=PUYO_FIX}` を送り、受信側は即 `playSe('puyo_fix')`。これで相手の設置音が自分と同じ間で鳴る。LockChain/Lock 側では `puyo_fix` を鳴らさない（二重発音回避）。
+> **ぷよ設置音は SE（`0x0a`）で同期**: 旧版は LockChain/Lock 到着時に `puyo_fix` を鳴らしていたが、これらは固定アニメ後のため**実際の着地より遅れる**。設置音は `_fixPuyo`／split 着地の `playSe('puyo_fix')` と同じ瞬間に `SE{seId=PUYO_FIX}` を送り、受信側は即 `playSe('puyo_fix')`。LockChain/Lock 側では `puyo_fix` を鳴らさない（二重発音回避）。**クイックドロップ**は `_fixPuyo(viaQuickDrop)` が `puyo_fix` を鳴らさない（＝相手にも届かない）ため、`_tryQuickDrop` で `SE{seId=PUYO_DROP}` を別途送り、受信側で `playSe('puyo_drop')`。なお LockChain 自体も `_beginFixAnimWait`（固定振動の開始）へ送信を前倒ししたので、相手側でも設置盤面・振動・SE がほぼ同時に立ち上がる。
 
 ## 5. 盤面スナップショット（Lock `0x02` ボディ）
 

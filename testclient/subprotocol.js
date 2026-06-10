@@ -39,8 +39,11 @@
   });
 
   // SE イベントの音種コード（seId）。盤面スナップショットでは表現できない発音タイミングを同期する。
-  const SE_ID = Object.freeze({ PUYO_FIX: 1 });
-  const SE_KEY = Object.freeze({ 1: 'puyo_fix' });
+  //   PUYO_FIX  = 通常の設置（固定振動）音
+  //   PUYO_DROP = クイックドロップ（ハードドロップ）の設置音。viaQuickDrop 時は puyo_fix を鳴らさず
+  //               こちらを鳴らすため、相手へも独立イベントで届ける（盤面 LockChain と別経路）。
+  const SE_ID = Object.freeze({ PUYO_FIX: 1, PUYO_DROP: 2 });
+  const SE_KEY = Object.freeze({ 1: 'puyo_fix', 2: 'puyo_drop' });
 
   // ── CONTROL アクション（仕様 §4・サブタグ 0x08） ──
   //   READY   = 開始/再戦の準備完了（seed を持つ。両者の seed を XOR して共有シードにする）
