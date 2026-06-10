@@ -26,7 +26,7 @@ mod payload;
 mod room;
 mod signaling;
 
-use connection::handle_reliable_connection;
+use connection::{handle_reliable_connection, handle_unreliable_connection};
 
 macro_rules! nest {
     ($($n:ident),+ $(,)?) => {
@@ -166,7 +166,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         connection::UNRELIABLE_CHANNEL_LABEL => Box::pin(async move {
                             nest!(game);
 
-                            let _ = tokio::spawn(connection::handle_unreliable_connection(dc, game, player_id))
+                            let _ = tokio::spawn(handle_unreliable_connection(dc, game, player_id))
                                 .instrument(info_span!("handle_connection", dc_label = %dc_label, player_id = %player_id));
                         }),
                         _ => {

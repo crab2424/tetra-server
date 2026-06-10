@@ -93,26 +93,33 @@ impl Game {
         }
     }
 
-    /// プレイヤーを Game の内部状態（接続表・待機列・経路表）から取り除き、
-    /// クローズすべき DataChannel を返す。
-    ///
-    /// `dc.close().await` は内部でネットワーク I/O を伴い時間がかかりうるため、
-    /// ここでは close せずチャンネルを返すだけにする。Game は単一の `RwLock` で
-    /// 共有されており、close を保持中の write ロック内で await すると
-    /// その間ずっと全ルームの中継 read ロックまで含む Game 全操作がブロックされる。
-    /// 呼び出し側は write ロックを解放してから返り値を `close().await` すること。
-    #[must_use = "返された DataChannel はロック解放後に close すること"]
-    pub fn remove_connection(&mut self, player_id: &Uuid) -> Vec<Arc<RTCDataChannel>> {
-        let channels: Vec<Arc<RTCDataChannel>> = self
+    /// プレイヤーを Game の内部状態（接続表・待機列・経路表）から取り除き，クローズする
+    pub fn remove_connection(&mut self, player_id: &Uuid) {
+        let channels: (Option<Arc<RTCDataChannel>>, Option<Arc<RTCDataChannel>>) = self
             .connections
             .remove(player_id)
-            .map(|pair| pair.reliable.into_iter().chain(pair.unreliable).collect())
-            .unwrap_or_default();
+            .map(|pair| (pair.reliable, pair.unreliable))
+            .unwrap_or((None, None));
+
         // 待機列からも除外
         self.matchmaking_queue.retain(|(pid, _, _)| pid != player_id);
         // 経路表・所属ルームからも退去させる
         self.leave_room(player_id);
-        channels
+
+        let player_id = *player_id;
+        
+        tokio::spawn(async move {
+            if let Some(dc) = channels.0 {
+                if let Err(err) = dc.close().await {
+                    println!("Failed to close reliable channel for player {}: {:?}", player_id, err);
+                }
+            }
+            if let Some(dc) = channels.1 {
+                if let Err(err) = dc.close().await {
+                    println!("Failed to close unreliable channel for player {}: {:?}", player_id, err);
+                }
+            }
+        });
     }
 
     /// プレイヤーをルームに参加させる（players への追加＋経路表更新）。
@@ -366,10 +373,8 @@ mod tests {
         game.add_player_to_room(room_id, guest, "guest".to_string(), "puyo".to_string())
             .expect("guest should join");
 
-        // DataChannel を持たない（reliable/unreliable とも None の）プレイヤーでも
-        // 状態の掃除は行われ、閉じるチャンネルは無いので空ベクタが返る。
-        let channels = game.remove_connection(&guest);
-        assert!(channels.is_empty());
+        // 退室させると、接続表からも消えるし，closeもされる．
+        game.remove_connection(&guest);
 
         // 経路表・ルームの players から消えている
         assert_eq!(game.room_of(&guest), None);
