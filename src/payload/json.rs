@@ -45,7 +45,6 @@ macro_rules! json_message {
                  */
                 #[derive(Serialize, Deserialize, Debug)]
                 #[serde(rename_all = "camelCase")]
-                #[allow(dead_code)]
                 pub struct [<JSON $struct_name>] {
                     $( pub $field_name: $field_type ),*
                 }

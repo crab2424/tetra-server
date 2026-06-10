@@ -42,7 +42,6 @@ macro_rules! schemas {
             )*
 
             #[derive(Serialize, Deserialize, SchemaRead, SchemaWrite, Debug, Clone, Copy)]
-            #[allow(dead_code)]
             #[repr(u8)]
             pub enum Opcode {
                 $(
@@ -51,7 +50,6 @@ macro_rules! schemas {
             }
 
             #[derive(Serialize, Deserialize, Debug)]
-            #[allow(dead_code)]
             #[repr(u8)]
             pub enum $enum_name {
                 $(
