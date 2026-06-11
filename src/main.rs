@@ -14,6 +14,9 @@ use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::prelude::*;
 use webrtc::api::APIBuilder;
 use webrtc::api::media_engine::MediaEngine;
+use webrtc::api::setting_engine::SettingEngine;
+use webrtc::ice::mdns::MulticastDnsMode;
+use webrtc::ice::network_type::NetworkType;
 use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
 use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::peer_connection::configuration::RTCConfiguration;
@@ -71,7 +74,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut m = MediaEngine::default();
     m.register_default_codecs()?;
-    let api = Arc::new(APIBuilder::new().with_media_engine(m).build());
+
+    // ── ICE 候補生成のチューニング ──
+    // このサーバーは NAT 配下（自宅PC・ポート解放なし）で動くため、ブラウザから到達
+    // できるのは STUN 由来の srflx 候補のみ。デフォルトのままだと余計な候補が混ざる:
+    //  ① mDNS（`.local` ホスト候補）— 別ネットワークのブラウザは名前解決できず無駄。
+    //     QueryAndGather が既定なので Disabled にして実IP候補のみ出す。
+    //  ② IPv6（udp6）— このホストは IPv6 で STUN へ到達できず `No route to host` を
+    //     量産し、link-local(fe80) の bind 失敗ログも溢れる。UDP4 に限定して排除する。
+    let mut se = SettingEngine::default();
+    se.set_ice_multicast_dns_mode(MulticastDnsMode::Disabled);
+    se.set_network_types(vec![NetworkType::Udp4]);
+
+    let api = Arc::new(
+        APIBuilder::new()
+            .with_media_engine(m)
+            .with_setting_engine(se)
+            .build(),
+    );
     let config = RTCConfiguration {
         ice_servers: vec![RTCIceServer {
             urls: vec![

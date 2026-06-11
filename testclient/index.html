@@ -166,6 +166,7 @@ function connect() {
       pendingCandidates.length = 0;
     } else if (sig.type === "candidate") {
       const cand = { candidate: sig.candidate, sdpMid: sig.sdp_mid, sdpMLineIndex: sig.sdp_m_line_index };
+      log("← server candidate: " + candType(sig.candidate), "info");
       if (remoteSet) await addCandidate(cand); else pendingCandidates.push(cand);
     }
   };
@@ -174,10 +175,15 @@ function connect() {
     pc = new RTCPeerConnection({ iceServers: [{ urls: "stun:stun.l.google.com:19302" }] });
     pc.oniceconnectionstatechange = () => log("ICE: " + pc.iceConnectionState, "info");
     pc.onicecandidate = (e) => {
-      if (e.candidate) ws.send(JSON.stringify({
-        type: "candidate", candidate: e.candidate.candidate,
-        sdp_mid: e.candidate.sdpMid, sdp_m_line_index: e.candidate.sdpMLineIndex,
-      }));
+      if (e.candidate) {
+        log("→ local candidate: " + candType(e.candidate.candidate), "info");
+        ws.send(JSON.stringify({
+          type: "candidate", candidate: e.candidate.candidate,
+          sdp_mid: e.candidate.sdpMid, sdp_m_line_index: e.candidate.sdpMLineIndex,
+        }));
+      } else {
+        log("→ local candidate gathering 完了", "info");
+      }
     };
     reliable = pc.createDataChannel("reliable-main", { ordered: true });
     unreliable = pc.createDataChannel("unreliable-main", { ordered: false, maxRetransmits: 0 });
@@ -303,6 +309,14 @@ function handleJsonResponse(msg) {
 
 async function addCandidate(c) {
   try { await pc.addIceCandidate(c); } catch (e) { log("addIceCandidate 失敗: " + e.message, "err"); }
+}
+
+// ICE candidate 文字列から typ(host/srflx/relay) と接続先 ip:port を抜き出して短縮表示
+function candType(candStr) {
+  if (!candStr) return "(empty)";
+  const m = /candidate:\S+ \d+ (\S+) \d+ (\S+) (\d+) typ (\S+)/.exec(candStr);
+  if (!m) return candStr;
+  return `typ ${m[4]} ${m[1].toLowerCase()} ${m[2]}:${m[3]}`;
 }
 
 // ---- actions ----
