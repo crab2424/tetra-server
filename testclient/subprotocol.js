@@ -42,8 +42,26 @@
   //   PUYO_FIX  = 通常の設置（固定振動）音
   //   PUYO_DROP = クイックドロップ（ハードドロップ）の設置音。viaQuickDrop 時は puyo_fix を鳴らさず
   //               こちらを鳴らすため、相手へも独立イベントで届ける（盤面 LockChain と別経路）。
-  const SE_ID = Object.freeze({ PUYO_FIX: 1, PUYO_DROP: 2 });
-  const SE_KEY = Object.freeze({ 1: 'puyo_fix', 2: 'puyo_drop' });
+  //   tet は盤面スナップショット（Lock）だけでは操作音が表現できないため、操作SEを離散イベント
+  //   で同期する（move/rotate/drop/harddrop/lock/lock_hard/hold/ライン消去/tspin）。ぷよは連鎖SEを
+  //   受信側パペットが自前再生で鳴らすので、ここには tet の操作SEのみを足す。
+  //   ※ gameover/pause/resume は載せない（gameover は GameOver(0x07) 経由、pause/resume は同期不要）。
+  const SE_ID = Object.freeze({
+    PUYO_FIX: 1, PUYO_DROP: 2,
+    TET_MOVE: 3, TET_ROTATE: 4, TET_TSPIN_ROT: 5, TET_DROP: 6, TET_HARDDROP: 7,
+    TET_LOCK: 8, TET_LOCK_HARD: 9, TET_HOLD: 10,
+    TET_1LINE: 11, TET_2LINES: 12, TET_3LINES: 13, TET_4LINES: 14, TET_TSPIN: 15,
+  });
+  const SE_KEY = Object.freeze({
+    1: 'puyo_fix', 2: 'puyo_drop',
+    3: 'move', 4: 'rotate', 5: 'tspin_rot', 6: 'drop', 7: 'harddrop',
+    8: 'lock', 9: 'lock_hard', 10: 'hold',
+    11: '1line', 12: '2lines', 13: '3lines', 14: '4lines', 15: 'tspin',
+  });
+  // 送信側用の逆引き（SE キー文字列 → seId）。未登録キー（gameover 等）は undefined＝送らない。
+  const SE_KEY_TO_ID = Object.freeze(
+    Object.fromEntries(Object.entries(SE_KEY).map(([id, k]) => [k, Number(id)]))
+  );
 
   // ── CONTROL アクション（仕様 §4・サブタグ 0x08） ──
   //   READY   = 開始/再戦の準備完了（seed を持つ。両者の seed を XOR して共有シードにする）
@@ -136,13 +154,16 @@
   //   ぷよ: t:u32, pivotX:i8, pivotY2:i8(=pivotY*2), orient:u8 → 7B
   // 色は載せない（受信側は直近 Spawn で既知）。
   // ──────────────────────────────────────────
-  function encodePieceStateTet({ t, type, x, y, rot }) {
-    return new Writer(8).u32(t).u8(type).i8(x).i8(y).u8(rot).finish();
+  //   末尾に score:u32 を載せる（相手パペットのスコア表示用。落下中も 30〜60Hz で更新されるので
+  //   ソフトドロップの加点も追従する）。score は累積スナップショット＝最新優先で取りこぼしOK。
+  function encodePieceStateTet({ t, type, x, y, rot, score = 0 }) {
+    return new Writer(12).u32(t).u8(type).i8(x).i8(y).u8(rot).u32(score >>> 0).finish();
   }
-  function encodePieceStatePuyo({ t, pivotX, pivotY, orient }) {
-    return new Writer(7).u32(t).i8(pivotX).i8(Math.round(pivotY * 2)).u8(orient).finish();
+  function encodePieceStatePuyo({ t, pivotX, pivotY, orient, score = 0 }) {
+    return new Writer(11).u32(t).i8(pivotX).i8(Math.round(pivotY * 2)).u8(orient).u32(score >>> 0).finish();
   }
   // rule: 'tet' | 'puyo'（受信側が相手の rule を文脈から知っている前提）
+  //   score は末尾拡張。旧フレーム（score 無し）とも混信しないよう remaining で防御的に読む。
   function decodePieceState(data, rule) {
     const r = new Reader(data);
     const t = r.u32();
@@ -150,13 +171,15 @@
       const pivotX = r.i8();
       const pivotY = r.i8() / 2;
       const orient = r.u8();
-      return { kind: "piece", rule, t, pivotX, pivotY, orient };
+      const score = r.remaining >= 4 ? r.u32() : 0;
+      return { kind: "piece", rule, t, pivotX, pivotY, orient, score };
     }
     const type = r.u8();
     const x = r.i8();
     const y = r.i8();
     const rot = r.u8();
-    return { kind: "piece", rule: "tet", t, type, x, y, rot };
+    const score = r.remaining >= 4 ? r.u32() : 0;
+    return { kind: "piece", rule: "tet", t, type, x, y, rot, score };
   }
 
   // ──────────────────────────────────────────
@@ -367,7 +390,7 @@
     VERSION: 1,
     TET_COLS, TET_ROWS, TET_BUFFER_ROWS, TET_TOTAL_ROWS,
     PUYO_COLS, PUYO_ROWS, TET_EMPTY, PUYO_EMPTY,
-    EV, CTRL, RULE_CODE, ruleToCode, codeToRule, SE_ID, SE_KEY,
+    EV, CTRL, RULE_CODE, ruleToCode, codeToRule, SE_ID, SE_KEY, SE_KEY_TO_ID,
     // PieceState
     encodePieceStateTet, encodePieceStatePuyo, decodePieceState,
     // GameEvent encoders

@@ -38,14 +38,18 @@
 ```
 共通先頭: t:u32
 
-テト本体（4B）:  type:u8(0–6)  x:i8  y:i8  rot:u8(0–3)
-  → フレーム計 8B
+テト本体（8B）:  type:u8(0–6)  x:i8  y:i8  rot:u8(0–3)  score:u32
+  → フレーム計 12B
 
-ぷよ本体（3B）:  pivotX:i8  pivotY2:i8(= pivotY*2、x.5 刻みを整数化)  orient:u8(targetRot 0–3)
-  → フレーム計 7B
+ぷよ本体（7B）:  pivotX:i8  pivotY2:i8(= pivotY*2、x.5 刻みを整数化)  orient:u8(targetRot 0–3)  score:u32
+  → フレーム計 11B
 ```
 
 受信側は前後サンプルを線形補間して滑らかに描画する。
+
+`score:u32`（末尾拡張）は相手パペットのスコア表示用。落下中も 30〜60Hz で流れるため、ソフトドロップの
+加点もリアルタイムに追従する（累積スナップショット＝最新優先で取りこぼしOK）。デコードは `remaining>=4` の
+ときのみ読む防御実装で、score 無しの旧フレームとも混信しない。
 
 ## 4. GameEvent（`0x06`・reliable）
 
@@ -62,7 +66,7 @@
 | `0x07` | GameOver | `result:u8`（0=topout/負, 1=clear/勝） |
 | `0x08` | **Control（開始/再戦合意・ルール変更）** | `action:u8`, `seed:u32`。`action`=`0x01 READY`（開始/再戦の準備完了。`seed`=共有シード素材）/`0x02 UNREADY`（準備取消・`seed` 未使用）/`0x03 RULE`（在室中のルール変更通知。`seed`=ルールコード `0=tet` / `1=puyo`） |
 | `0x09` | LockChain（ぷよ連鎖起点盤面） | `board:u8×102`（ぷよ盤面 §5）。**ぷよ専用**。連鎖判定の直前＝操作ぷよ確定盤面を `chainCount===0`（連鎖開始前）の **`_beginFixAnimWait`（固定振動の開始）**で 1 回送る。受信側パペットはこの盤面から連鎖を**自前で再生**（実 PuyoGame の連鎖状態機械を駆動＝点滅/連鎖文字/落下/連鎖SEを完全再現）。受信時は旧盤面との差分で「今置かれたぷよ」を拾い、固定振動(`_addPuyoAnim`＋fixAnim)を1回挟んでから連鎖判定に入る＝ローカルと同じ「固定→振動→消去」順を再現 |
-| `0x0a` | SE（離散SE発音同期） | `seId:u8`（`1`=puyo_fix / `2`=puyo_drop）。盤面イベントから独立して「この音を今鳴らす」を相手へ送る。発音タイミングが盤面スナップショット（Lock/LockChain）とずれる音に使う。通常設置音はペア着地（`_fixPuyo`/split 着地）で `puyo_fix` を、クイックドロップ設置音は `_tryQuickDrop` で `puyo_drop` を送り、受信側は即 `playSe` |
+| `0x0a` | SE（離散SE発音同期） | `seId:u8`。盤面イベントから独立して「この音を今鳴らす」を相手へ送る。発音タイミングが盤面スナップショット（Lock/LockChain）では表現できない音に使う。**ぷよ**: `1`=puyo_fix（`_fixPuyo`/split 着地）/`2`=puyo_drop（`_tryQuickDrop`）。**テト**: `3`=move / `4`=rotate / `5`=tspin_rot / `6`=drop（ソフトドロップ毎マス） / `7`=harddrop / `8`=lock / `9`=lock_hard / `10`=hold / `11`=1line / `12`=2lines / `13`=3lines / `14`=4lines / `15`=tspin。テトは `playSe(key)` を単一チョークポイントから転送（自分の権威エンジンのみ）。`gameover`（GameOver 0x07 経由）/`pause`/`resume` は seId 未割当＝送らない。受信側は `seKey` を即 `playSe` |
 
 > **表示同期 vs ゲーム影響**: `0x04 GarbageSend` のみ受信側の自分のゲームに反映（予告に積む。相殺/着弾は受信側の既存ロジック）。他はすべて相手ミニ盤面への描画のみで自分のゲームに影響しない。
 
