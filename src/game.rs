@@ -93,7 +93,13 @@ impl Game {
     pub fn check_if_ready(&self, id: Uuid) {
         if let Some(pair) = self.connections.get(&id) {
             if pair.reliable.is_some() && pair.unreliable.is_some() {
-                let mut state = pair.state.lock().unwrap();
+                let mut state = match pair.state.lock() {
+                    Ok(s) => s,
+                    Err(e) => {
+                        println!("Failed to lock connection state for player {}: {:?}", id, e);
+                        return;
+                    }
+                };
                 *state = ConnectionState::Connected;
                 println!(
                     "🎉 プレイヤー [{}] の Reliable と Unreliable が両方揃いました！通信準備完了！",
@@ -246,7 +252,13 @@ impl Game {
             .iter()
             .position(|(pid, _, _)| *pid != player_id)
         {
-            let (opp_id, opp_name, opp_rule) = self.matchmaking_queue.remove(pos).unwrap();
+            let (opp_id, opp_name, opp_rule) = match self.matchmaking_queue.remove(pos) {
+                Some(entry) => entry,
+                None => {
+                    // まれに remove(pos) が None を返すことがある（pos は存在していたのに）。念のため安全策。
+                    return MatchResult::Waiting;
+                }
+            };
             // 待機していた相手をオーナーにしてルームを作成（相手は player[0] として入る）
             let (room_id, _code) = self.new_room(
                 opp_id,
@@ -631,7 +643,10 @@ mod tests {
         game.add_player_to_room(room_id, b, "B".to_string(), "tet".to_string())
             .expect("B joins");
         {
-            let room = game.rooms.get_mut(&room_id).unwrap();
+            let room = match game.rooms.get_mut(&room_id) {
+                Some(r) => r,
+                None => panic!("room should exist"),
+            };
             room.status = RoomStatus::Playing;
             room.alive_players = vec![a, b];
         }

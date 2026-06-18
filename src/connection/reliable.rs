@@ -117,7 +117,13 @@ pub async fn handle_reliable_connection(
 
                     let mut game = game.write().await;
                     if let Some(state) = game.get_connection_state(&id) {
-                        let mut state = state.lock().unwrap();
+                        let mut state = match state.lock() {
+                            Ok(s) => s,
+                            Err(e) => {
+                                println!("Failed to lock connection state for player {}: {:?}", id, e);
+                                return;
+                            }
+                        };
                         *state = crate::game::ConnectionState::Disconnected;
                     }
                     game.remove_connection(&id);

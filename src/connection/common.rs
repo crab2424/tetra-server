@@ -106,7 +106,13 @@ pub async fn disconnect_player(
     {
         let game = game.write().await;
         if let Some(state) = game.get_connection_state(&id) {
-            let mut state = state.lock().unwrap();
+            let mut state = match state.lock() {
+                Ok(s) => s,
+                Err(e) => {
+                    println!("Failed to lock connection state for player {}: {:?}", id, e);
+                    return;
+                }
+            };
             if matches!(*state, crate::game::ConnectionState::Disconnected) {
                 // 既に切断猶予中
                 return;
@@ -138,10 +144,14 @@ pub async fn disconnect_player(
         let still_disconnected = game
             .get_connection_state(&id)
             .map(|s| {
-                matches!(
-                    *s.lock().unwrap(),
-                    crate::game::ConnectionState::Disconnected
-                )
+                let s = match s.lock() {
+                    Ok(s) => s,
+                    Err(e) => {
+                        println!("Failed to lock connection state for player {}: {:?}", id, e);
+                        return false;
+                    }
+                };
+                matches!(*s, crate::game::ConnectionState::Disconnected)
             })
             .unwrap_or(false);
         (still_disconnected, game.room_of(&id))
