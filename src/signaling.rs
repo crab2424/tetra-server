@@ -23,6 +23,10 @@ pub enum SignalMessage {
 
     // クライアント認証
     Auth {
-        client_version: String,
+        version: String,
+    },
+    AuthResult {
+        success: bool,
+        message: Option<String>,
     },
 }

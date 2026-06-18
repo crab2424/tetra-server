@@ -48,15 +48,6 @@ struct AppState {
     allow_versions: Vec<String>,
 }
 
-/**
- * バージョンのベクタを簡潔に書くためのマクロ。
- */
-macro_rules! vers {
-    ($($v:expr),+ $(,)?) => {
-        vec![$($v.to_string()),+]
-    };
-}
-
 /// ファイルディスクリプタのソフト上限を引き上げる。
 /// webrtc-rs は接続ごとに ICE 用 UDP ソケットを多数開き、close 後も一部が即時解放されない
 /// （ライブラリ側の挙動）。既定の soft=1024 だと多数接続でFDが枯渇するため、ハード上限の
@@ -323,18 +314,46 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     };
                     let _ = peer_connection.add_ice_candidate(init).await;
                 }
-                signaling::SignalMessage::Auth { client_version } => {
-                    if !state.allow_versions.contains(&client_version) {
-                        error!(
-                            "Rejected connection with unsupported client version: {client_version}"
-                        );
+                signaling::SignalMessage::Auth { version } => {
+                    if !state.allow_versions.contains(&version) {
+                        error!("Rejected connection with unsupported client version: {version}");
+
+                        let _ = ws_sender.lock().await.send(Message::Text(
+                            serde_json::to_string(&signaling::SignalMessage::AuthResult {
+                                success: false,
+                                message: Some(format!(
+                                    "Unsupported client version: {version}. Allowed versions: {:?}\nPlease reload or reopen the client to update to a supported version.",
+                                    state.allow_versions
+                                )),
+                            })
+                            .unwrap()
+                            .into(),
+                        )).await;
+
                         break;
                     } else {
+                        info!("Client authenticated with version: {version}");
+
+                        let _ = ws_sender
+                            .lock()
+                            .await
+                            .send(Message::Text(
+                                serde_json::to_string(&signaling::SignalMessage::AuthResult {
+                                    success: true,
+                                    message: None,
+                                })
+                                .unwrap()
+                                .into(),
+                            ))
+                            .await;
+
                         version_authenticated = true;
-                        info!("Client authenticated with version: {client_version}");
                     }
                 }
-                _ => {}
+                _ => {
+                    debug!("Unexpected signaling message type: {signal:?}");
+                    continue;
+                }
             }
         }
     }
@@ -376,7 +395,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Starting server...");
 
-    let ws_addr = env::var("WS_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".to_string());
+    let http_addr = env::var("HTTP_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".to_string());
 
     let mut m = MediaEngine::default();
     m.register_default_codecs()?;
@@ -417,7 +436,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         game,
         api,
         config,
-        allow_versions: vers!("2.0.0", "1.3.0"),
+        allow_versions: vec![
+            env::var("ALLOW_VERSIONS")
+                .unwrap_or_else(|_| "0.0.0".to_string())
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .collect(),
+        ],
     };
 
     let app = Router::new()
@@ -425,8 +450,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/ws", get(ws_handler))
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind(&ws_addr).await?;
-    info!("Listening on {ws_addr}...");
+    let listener = tokio::net::TcpListener::bind(&http_addr).await?;
+    info!("Listening on {http_addr}...");
     axum::serve(listener, app).await?;
 
     Ok(())
