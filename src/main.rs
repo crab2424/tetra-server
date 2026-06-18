@@ -1,8 +1,16 @@
 use anyhow::Result;
+use axum::{
+    Router,
+    extract::{
+        State,
+        ws::{Message, WebSocket, WebSocketUpgrade},
+    },
+    response::IntoResponse,
+    routing::get,
+};
 use futures_util::{SinkExt, StreamExt};
 use std::env;
 use std::sync::Arc;
-use tokio::net::TcpListener;
 use tokio::sync::{Mutex, RwLock};
 use tracing::Instrument;
 use tracing::debug;
@@ -34,6 +42,13 @@ macro_rules! nest {
     };
 }
 
+#[derive(Clone)]
+struct AppState {
+    game: Arc<RwLock<game::Game>>,
+    api: Arc<webrtc::api::API>,
+    config: RTCConfiguration,
+}
+
 /// ファイルディスクリプタのソフト上限を引き上げる。
 /// webrtc-rs は接続ごとに ICE 用 UDP ソケットを多数開き、close 後も一部が即時解放されない
 /// （ライブラリ側の挙動）。既定の soft=1024 だと多数接続でFDが枯渇するため、ハード上限の
@@ -57,6 +72,250 @@ fn raise_fd_limit() {
             }
         }
     }
+}
+
+/// 超サンプルエンドポイント
+async fn hello() -> &'static str {
+    "Hello, World!"
+}
+
+/// WebSocketをアップグレードするエンドポイント
+async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
+    ws.on_upgrade(|socket| handle_socket(socket, state))
+}
+
+/// WebSocketのハンドラの実態
+async fn handle_socket(socket: WebSocket, state: AppState) {
+    let (ws_sender, mut ws_receiver) = socket.split();
+    let ws_sender = Arc::new(Mutex::new(ws_sender));
+
+    let peer_connection = Arc::new(
+        state
+            .api
+            .new_peer_connection(state.config)
+            .await
+            .expect("Failed to create peer connection"),
+    );
+
+    // この接続（=1本の PeerConnection）に属する player_id。
+    // 初期は新規発番だが、再接続offer(player_id付き)を受けると既存プレイヤーのIDへ
+    // 差し替える（再バインド）。各ハンドラは発火時に共有値を読むため、Mutex で包む。
+    let player_id_shared = Arc::new(Mutex::new(uuid::Uuid::new_v4()));
+
+    let ws_sender_for_ice = Arc::clone(&ws_sender);
+    let player_id_for_ice = Arc::clone(&player_id_shared);
+    peer_connection.on_ice_candidate(Box::new(move |candidate| {
+        let ws_sender = Arc::clone(&ws_sender_for_ice);
+        let player_id_for_ice = Arc::clone(&player_id_for_ice);
+        Box::pin(async move {
+            if let Some(c) = candidate {
+                let init = match c.to_json() {
+                    Ok(v) => v,
+                    Err(e) => {
+                        debug!("Failed to serialize ICE candidate: {e}");
+                        return;
+                    }
+                };
+                let pid = *player_id_for_ice.lock().await;
+                let msg = signaling::SignalMessage::Candidate {
+                    candidate: init.candidate,
+                    sdp_mid: init.sdp_mid,
+                    sdp_m_line_index: init.sdp_mline_index,
+                    user_id: pid,
+                };
+                let json = serde_json::to_string(&msg);
+                match json {
+                    Ok(j) => {
+                        let _ = ws_sender.lock().await.send(Message::Text(j.into())).await;
+                    }
+                    Err(e) => {
+                        debug!("Failed to serialize signaling message: {e}");
+                        return;
+                    }
+                };
+            }
+        })
+    }));
+
+    {
+        let game = Arc::clone(&state.game);
+        // PC への弱参照（cycle を作らず、実切断時に disconnect_player が close() してFDを解放する）
+        let pc_weak = Arc::downgrade(&peer_connection);
+        let player_id_for_state = Arc::clone(&player_id_shared);
+        peer_connection.on_peer_connection_state_change(Box::new(
+            move |s: RTCPeerConnectionState| {
+                debug!("Peer connection state changed: {s:?}");
+                // 終端状態 (Failed/Closed) のみで切断処理を起動する。
+                // Disconnected は一過性(ICE瞬断で復帰しうる)なので起動しない
+                //   → ICE が failed_timeout(8s) を過ぎて初めて Failed になり、実切断と確定する。
+                // シグナリングWSの切断はトリガにしない（WSは確立後に閉じる設計）。
+                let trigger = matches!(
+                    s,
+                    RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed
+                );
+                let game = Arc::clone(&game);
+                let pc_weak = pc_weak.clone();
+                let player_id_for_state = Arc::clone(&player_id_for_state);
+                Box::pin(async move {
+                    if trigger {
+                        let pid = *player_id_for_state.lock().await;
+                        connection::disconnect_player(game, pid, Some(pc_weak)).await;
+                    }
+                })
+            },
+        ));
+    }
+
+    // Offer ハンドラで再接続(player_id再利用)判定に Game を読むため、ループ用クローンを
+    // on_data_channel クロージャが game をムーブするより前に確保しておく。
+    let game_for_loop = Arc::clone(&state.game);
+    let player_id_for_loop = Arc::clone(&player_id_shared);
+
+    let game_for_dc = Arc::clone(&state.game);
+    let player_id_for_dc = Arc::clone(&player_id_shared);
+    peer_connection.on_data_channel(Box::new(
+        move |dc: Arc<webrtc::data_channel::RTCDataChannel>| {
+            let game = Arc::clone(&game_for_dc);
+            let player_id_for_dc = Arc::clone(&player_id_for_dc);
+            let dc_label = dc.label().to_string();
+
+            println!("Data channel created: {dc_label}");
+
+            match dc_label.as_str() {
+                connection::RELIABLE_CHANNEL_LABEL => Box::pin(async move {
+                    nest!(game);
+                    // チャネルが開くのは offer 処理後なので、ここでは確定済みの player_id を読む。
+                    let pid = *player_id_for_dc.lock().await;
+                    let _ = tokio::spawn(handle_reliable_connection(dc, game, pid)).instrument(
+                        info_span!("handle_connection", dc_label = %dc_label, player_id = %pid),
+                    );
+                }),
+                connection::UNRELIABLE_CHANNEL_LABEL => Box::pin(async move {
+                    nest!(game);
+                    let pid = *player_id_for_dc.lock().await;
+                    let _ = tokio::spawn(handle_unreliable_connection(dc, game, pid)).instrument(
+                        info_span!("handle_connection", dc_label = %dc_label, player_id = %pid),
+                    );
+                }),
+                _ => {
+                    debug!("Unknown data channel label: {dc_label}");
+                    return Box::pin(async {});
+                }
+            }
+        },
+    ));
+
+    while let Some(Ok(msg)) = ws_receiver.next().await {
+        if let Message::Text(text) = msg {
+            // 不正なシグナリングメッセージでタスクを panic させない
+            let signal: signaling::SignalMessage = match serde_json::from_str(&text) {
+                Ok(v) => v,
+                Err(e) => {
+                    debug!("Failed to parse signaling message: {e}");
+                    continue;
+                }
+            };
+
+            match signal {
+                signaling::SignalMessage::Offer {
+                    sdp,
+                    player_id: reconnect_id,
+                } => {
+                    // ★ 再接続: クライアントが既存の player_id を載せてきて、その人がまだ
+                    //    サーバーに居る（猶予中など）なら、この新PCをそのIDへ再バインドする。
+                    //    state を Establishing に戻して disconnect_player の猶予removalを止める
+                    //    （新しい両チャネルが揃えば check_if_ready が Connected に進める）。
+                    if let Some(rid) = reconnect_id {
+                        let exists = {
+                            let g = game_for_loop.read().await;
+                            g.get_connection_state(&rid).is_some()
+                        };
+                        if exists {
+                            *player_id_for_loop.lock().await = rid;
+                            let g = game_for_loop.read().await;
+                            if let Some(conn_state) = g.get_connection_state(&rid) {
+                                let s = conn_state.lock();
+                                if let Ok(mut s) = s {
+                                    if matches!(*s, crate::game::ConnectionState::Disconnected) {
+                                        *s = crate::game::ConnectionState::Establishing;
+                                    }
+                                }
+                            }
+                            println!(
+                                "Reconnect offer: rebinding new PC to existing player [{rid}]"
+                            );
+                        } else {
+                            println!(
+                                "Reconnect offer for unknown player [{rid}]; treating as new connection."
+                            );
+                        }
+                    }
+
+                    let offer = match RTCSessionDescription::offer(sdp) {
+                        Ok(o) => o,
+                        Err(e) => {
+                            debug!("Failed to parse SDP offer: {e}");
+                            continue;
+                        }
+                    };
+
+                    if let Err(e) = peer_connection.set_remote_description(offer).await {
+                        debug!("Failed to set remote description: {e}");
+                        continue;
+                    }
+
+                    let answer = match peer_connection.create_answer(None).await {
+                        Ok(a) => a,
+                        Err(e) => {
+                            debug!("Failed to create SDP answer: {e}");
+                            continue;
+                        }
+                    };
+
+                    if let Err(e) = peer_connection.set_local_description(answer.clone()).await {
+                        debug!("Failed to set local description: {e}");
+                        continue;
+                    }
+
+                    let response = match serde_json::to_string(&signaling::SignalMessage::Answer {
+                        sdp: answer.sdp,
+                    }) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            debug!("Failed to serialize signaling message: {e}");
+                            continue;
+                        }
+                    };
+
+                    let _ = ws_sender
+                        .lock()
+                        .await
+                        .send(Message::Text(response.into()))
+                        .await;
+                }
+                signaling::SignalMessage::Candidate {
+                    candidate,
+                    sdp_mid,
+                    sdp_m_line_index,
+                    user_id: _,
+                } => {
+                    let init = RTCIceCandidateInit {
+                        candidate,
+                        sdp_mid,
+                        sdp_mline_index: sdp_m_line_index,
+                        username_fragment: None,
+                    };
+                    let _ = peer_connection.add_ice_candidate(init).await;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // ★ シグナリングWSが閉じても PeerConnection は閉じない。
+    //   WSは「確立後に閉じてよい」設計（client connection.ts 参照）で、DataChannel は
+    //   生き続けるため。ここで close すると対戦中に WS がアイドル切断された瞬間に
+    //   全員の接続が切れる。リソース解放は PeerConnection が Failed になった時に行う。
 }
 
 #[tokio::main]
@@ -91,9 +350,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Starting server...");
 
     let ws_addr = env::var("WS_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".to_string());
-    info!("Listening on {ws_addr}...");
-
-    let listener = TcpListener::bind(&ws_addr).await?;
 
     let mut m = MediaEngine::default();
     m.register_default_codecs()?;
@@ -130,231 +386,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // なので RwLock を使い、中継の読み取りロックを全ルーム並行に取れるようにする(Issue #8)。
     let game = Arc::new(RwLock::new(game::Game::default()));
 
-    // accept() が一過性のエラー（FD枯渇など）を返しても、ループを抜けて
-    // サーバーを終了させない。ログを出して少し待ち、受付を継続する。
-    loop {
-        let (stream, _) = match listener.accept().await {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::error!("accept() failed (continuing): {e}");
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                continue;
-            }
-        };
-        nest!(game, api);
+    let state = AppState { game, api, config };
 
-        let config = config.clone();
+    let app = Router::new()
+        .route("/", get(hello))
+        .route("/ws", get(ws_handler))
+        .with_state(state);
 
-        tokio::spawn(async move {
-            let ws_stream = tokio_tungstenite::accept_async(stream)
-                .await
-                .expect("Failed to accept WebSocket connection");
-            debug!("Accepted WebSocket connection");
+    let listener = tokio::net::TcpListener::bind(&ws_addr).await?;
+    info!("Listening on {ws_addr}...");
+    axum::serve(listener, app).await?;
 
-            let (ws_sender, mut ws_receiver) = ws_stream.split();
-            let ws_sender = Arc::new(Mutex::new(ws_sender));
-
-            let peer_connection = Arc::new(
-                api.new_peer_connection(config)
-                    .await
-                    .expect("Failed to create peer connection"),
-            );
-
-            // この接続（=1本の PeerConnection）に属する player_id。
-            // 初期は新規発番だが、再接続offer(player_id付き)を受けると既存プレイヤーのIDへ
-            // 差し替える（再バインド）。各ハンドラは発火時に共有値を読むため、Mutex で包む。
-            let player_id_shared = Arc::new(Mutex::new(uuid::Uuid::new_v4()));
-
-            let ws_sender_for_ice = Arc::clone(&ws_sender);
-            let player_id_for_ice = Arc::clone(&player_id_shared);
-            peer_connection.on_ice_candidate(Box::new(move |candidate| {
-                let ws_sender = Arc::clone(&ws_sender_for_ice);
-                let player_id_for_ice = Arc::clone(&player_id_for_ice);
-                Box::pin(async move {
-                    if let Some(c) = candidate {
-                        let init = match c.to_json() {
-                            Ok(v) => v,
-                            Err(e) => {
-                                debug!("Failed to serialize ICE candidate: {e}");
-                                return;
-                            }
-                        };
-                        let pid = *player_id_for_ice.lock().await;
-                        let msg = signaling::SignalMessage::Candidate {
-                            candidate: init.candidate,
-                            sdp_mid: init.sdp_mid,
-                            sdp_m_line_index: init.sdp_mline_index,
-                            user_id: pid,
-                        };
-                        let json = serde_json::to_string(&msg).unwrap();
-                        let _ = ws_sender
-                            .lock()
-                            .await
-                            .send(tokio_tungstenite::tungstenite::Message::Text(json.into()))
-                            .await;
-                    }
-                })
-            }));
-
-            {
-                nest!(game);
-                // PC への弱参照（cycle を作らず、実切断時に disconnect_player が close() してFDを解放する）
-                let pc_weak = Arc::downgrade(&peer_connection);
-                let player_id_for_state = Arc::clone(&player_id_shared);
-                peer_connection.on_peer_connection_state_change(Box::new(
-                    move |state: RTCPeerConnectionState| {
-                        debug!("Peer connection state changed: {state:?}");
-                        // 終端状態 (Failed/Closed) のみで切断処理を起動する。
-                        // Disconnected は一過性(ICE瞬断で復帰しうる)なので起動しない
-                        //   → ICE が failed_timeout(8s) を過ぎて初めて Failed になり、実切断と確定する。
-                        // シグナリングWSの切断はトリガにしない（WSは確立後に閉じる設計）。
-                        let trigger = matches!(
-                            state,
-                            RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed
-                        );
-                        let game = Arc::clone(&game);
-                        let pc_weak = pc_weak.clone();
-                        let player_id_for_state = Arc::clone(&player_id_for_state);
-                        Box::pin(async move {
-                            if trigger {
-                                let pid = *player_id_for_state.lock().await;
-                                connection::disconnect_player(game, pid, Some(pc_weak)).await;
-                            }
-                        })
-                    },
-                ));
-            }
-
-            // Offer ハンドラで再接続(player_id再利用)判定に Game を読むため、ループ用クローンを
-            // on_data_channel クロージャが game をムーブするより前に確保しておく。
-            let game_for_loop = Arc::clone(&game);
-            let player_id_for_loop = Arc::clone(&player_id_shared);
-
-            let player_id_for_dc = Arc::clone(&player_id_shared);
-            peer_connection.on_data_channel(Box::new(
-                move |dc: Arc<webrtc::data_channel::RTCDataChannel>| {
-                    nest!(game);
-                    let player_id_for_dc = Arc::clone(&player_id_for_dc);
-                    let dc_label = dc.label().to_string();
-
-                    println!("Data channel created: {dc_label}");
-
-                    match dc_label.as_str() {
-                        connection::RELIABLE_CHANNEL_LABEL => Box::pin(async move {
-                            nest!(game);
-                            // チャネルが開くのは offer 処理後なので、ここでは確定済みの player_id を読む。
-                            let pid = *player_id_for_dc.lock().await;
-                            let _ = tokio::spawn(handle_reliable_connection(dc, game, pid))
-                                .instrument(info_span!("handle_connection", dc_label = %dc_label, player_id = %pid));
-                        }),
-                        connection::UNRELIABLE_CHANNEL_LABEL => Box::pin(async move {
-                            nest!(game);
-                            let pid = *player_id_for_dc.lock().await;
-                            let _ = tokio::spawn(handle_unreliable_connection(dc, game, pid))
-                                .instrument(info_span!("handle_connection", dc_label = %dc_label, player_id = %pid));
-                        }),
-                        _ => {
-                            debug!("Unknown data channel label: {dc_label}");
-                            return Box::pin(async {});
-                        }
-                    }
-                },
-            ));
-
-            while let Some(Ok(msg)) = ws_receiver.next().await {
-                if msg.is_text() {
-                    let Ok(text) = msg.to_text() else { continue };
-                    // 不正なシグナリングメッセージでタスクを panic させない
-                    let signal: signaling::SignalMessage = match serde_json::from_str(text) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            debug!("Failed to parse signaling message: {e}");
-                            continue;
-                        }
-                    };
-
-                    match signal {
-                        signaling::SignalMessage::Offer {
-                            sdp,
-                            player_id: reconnect_id,
-                        } => {
-                            // ★ 再接続: クライアントが既存の player_id を載せてきて、その人がまだ
-                            //    サーバーに居る（猶予中など）なら、この新PCをそのIDへ再バインドする。
-                            //    state を Establishing に戻して disconnect_player の猶予removalを止める
-                            //    （新しい両チャネルが揃えば check_if_ready が Connected に進める）。
-                            if let Some(rid) = reconnect_id {
-                                let exists = {
-                                    let g = game_for_loop.read().await;
-                                    g.get_connection_state(&rid).is_some()
-                                };
-                                if exists {
-                                    *player_id_for_loop.lock().await = rid;
-                                    let g = game_for_loop.read().await;
-                                    if let Some(state) = g.get_connection_state(&rid) {
-                                        let mut s = state.lock().unwrap();
-                                        if matches!(*s, crate::game::ConnectionState::Disconnected)
-                                        {
-                                            *s = crate::game::ConnectionState::Establishing;
-                                        }
-                                    }
-                                    println!(
-                                        "Reconnect offer: rebinding new PC to existing player [{rid}]"
-                                    );
-                                } else {
-                                    println!(
-                                        "Reconnect offer for unknown player [{rid}]; treating as new connection."
-                                    );
-                                }
-                            }
-
-                            peer_connection
-                                .set_remote_description(RTCSessionDescription::offer(sdp).unwrap())
-                                .await
-                                .unwrap();
-
-                            let answer = peer_connection.create_answer(None).await.unwrap();
-                            peer_connection
-                                .set_local_description(answer.clone())
-                                .await
-                                .unwrap();
-
-                            let response =
-                                serde_json::to_string(&signaling::SignalMessage::Answer {
-                                    sdp: answer.sdp,
-                                })
-                                .unwrap();
-
-                            let _ = ws_sender
-                                .lock()
-                                .await
-                                .send(tokio_tungstenite::tungstenite::Message::Text(
-                                    response.into(),
-                                ))
-                                .await;
-                        }
-                        signaling::SignalMessage::Candidate {
-                            candidate,
-                            sdp_mid,
-                            sdp_m_line_index,
-                            user_id: _,
-                        } => {
-                            let init = RTCIceCandidateInit {
-                                candidate,
-                                sdp_mid,
-                                sdp_mline_index: sdp_m_line_index,
-                                username_fragment: None,
-                            };
-                            let _ = peer_connection.add_ice_candidate(init).await;
-                        }
-                        _ => {}
-                    }
-                }
-            }
-
-            // ★ シグナリングWSが閉じても PeerConnection は閉じない。
-            //   WSは「確立後に閉じてよい」設計（client connection.ts 参照）で、DataChannel は
-            //   生き続けるため。ここで close すると対戦中に WS がアイドル切断された瞬間に
-            //   全員の接続が切れる。リソース解放は PeerConnection が Failed になった時に行う。
-        });
-    }
+    Ok(())
 }
