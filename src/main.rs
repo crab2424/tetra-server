@@ -316,7 +316,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         sdp_mline_index: sdp_m_line_index,
                         username_fragment: None,
                     };
-                    let _ = peer_connection.add_ice_candidate(init).await;
+                    if let Err(e) = peer_connection.add_ice_candidate(init).await {
+                        warn!("Failed to add ICE candidate: {e}");
+                    }
                 }
                 signaling::SignalMessage::Auth { version } => {
                     if !state.allow_versions.contains(&version) {
@@ -457,13 +459,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut m = MediaEngine::default();
     m.register_default_codecs()?;
-    // ICE タイムアウトを短縮して、クライアント切断(タブ閉じ/回線断)を素早く検知する。
-    // 既定だと failed まで ~25s かかり切断検知が遅れるため。
+    // ICE タイムアウト。切断検知を早めたいが、短すぎると低品質な回線
+    // (高レイテンシ・パケロス)でチェックが完了する前にFailedになってしまう
+    // (大学WIFI等での接続断の主因だった。旧設定は 5s/8s = 13s で機械的に打ち切っていた)。
     // disconnected: 一過性とみなす猶予 / failed: これを過ぎたら終端(Failed) / keepalive: 疎通確認間隔
     let mut s = webrtc::api::setting_engine::SettingEngine::default();
     s.set_ice_timeouts(
-        Some(std::time::Duration::from_secs(5)),
-        Some(std::time::Duration::from_secs(8)),
+        Some(std::time::Duration::from_secs(10)),
+        Some(std::time::Duration::from_secs(20)),
         Some(std::time::Duration::from_secs(2)),
     );
     let api = Arc::new(
