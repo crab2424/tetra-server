@@ -495,13 +495,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         game,
         api,
         config,
-        allow_versions: vec![
-            env::var("ALLOW_VERSIONS")
-                .unwrap_or_else(|_| "0.0.0".to_string())
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .collect(),
-        ],
+        allow_versions: env::var("ALLOW_VERSIONS")
+            .unwrap_or_else(|_| "0.0.0".to_string())
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .collect(),
     };
 
     let app = Router::new()
