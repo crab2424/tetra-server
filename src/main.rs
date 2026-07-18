@@ -464,6 +464,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // (大学WIFI等での接続断の主因だった。旧設定は 5s/8s = 13s で機械的に打ち切っていた)。
     // disconnected: 一過性とみなす猶予 / failed: これを過ぎたら終端(Failed) / keepalive: 疎通確認間隔
     let mut s = webrtc::api::setting_engine::SettingEngine::default();
+    // ICE_UDP_PORT_RANGE="50000-50100" のように指定すると、ICE候補のUDPポートを
+    // この範囲に固定する。EC2等でセキュリティグループのUDP開放範囲を絞るために必要。
+    // NAT_1TO1_IP にパブリックIP(Elastic IP)を指定すると、host候補をそのIPに
+    // 書き換えて広告する(EC2はNAT越しなのでこれがないと私有IPしか候補に出ない)。
+    if let Ok(range) = env::var("ICE_UDP_PORT_RANGE") {
+        if let Some((min, max)) = range.split_once('-') {
+            let min: u16 = min.trim().parse().expect("invalid ICE_UDP_PORT_RANGE min");
+            let max: u16 = max.trim().parse().expect("invalid ICE_UDP_PORT_RANGE max");
+            s.set_udp_network(webrtc::ice::udp_network::UDPNetwork::Ephemeral(
+                webrtc::ice::udp_network::EphemeralUDP::new(min, max)
+                    .expect("invalid ICE_UDP_PORT_RANGE"),
+            ));
+            info!("ICE UDP port range set to {min}-{max}");
+        }
+    }
+    if let Ok(ip) = env::var("NAT_1TO1_IP") {
+        s.set_nat_1to1_ips(
+            vec![ip.clone()],
+            webrtc::ice_transport::ice_candidate_type::RTCIceCandidateType::Host,
+        );
+        info!("NAT 1:1 IP set to {ip}");
+    }
     s.set_ice_timeouts(
         Some(std::time::Duration::from_secs(10)),
         Some(std::time::Duration::from_secs(20)),
