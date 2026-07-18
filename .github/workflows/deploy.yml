@@ -1,0 +1,28 @@
+name: Deploy to EC2
+
+on:
+  push:
+    branches: [main]
+  # Actionsタブから手動実行もできるようにする
+  workflow_dispatch:
+
+# 連続pushした場合は最後のデプロイだけ走らせる
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.EC2_SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H "${{ secrets.EC2_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: Deploy
+        run: |
+          ssh -i ~/.ssh/deploy_key ec2-user@"${{ secrets.EC2_HOST }}" \
+            'bash ~/tetra-server/deploy/deploy.sh'

@@ -1,4 +1,7 @@
 /target
 /logs
+/key
 **/.*
+!/.github/
+!/.github/**
 server.log
