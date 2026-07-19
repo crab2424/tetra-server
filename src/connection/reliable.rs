@@ -565,20 +565,10 @@ pub async fn handle_reliable_connection(
                                 let room_id = req.room_id;
                                 let setting = req.setting;
 
-                                let result = {
-                                    let mut g = game.write().await;
-                                    match g.rooms.get_mut(&room_id) {
-                                        None => Err("Room not found".to_string()),
-                                        Some(r) => {
-                                            if r.owner != id {
-                                                Err("Only the room owner can change match settings".to_string())
-                                            } else {
-                                                r.match_setting = setting.clone();
-                                                Ok(())
-                                            }
-                                        }
-                                    }
-                                };
+                                let result = game
+                                    .write()
+                                    .await
+                                    .update_match_setting(&id, room_id, setting.clone());
 
                                 jsend!(dc_clone, JSONUpdateMatchSettingResponse {
                                     id: req_id,

@@ -6,6 +6,58 @@ use webrtc::data_channel::RTCDataChannel;
 
 use crate::room::{Room, RoomStatus};
 
+/// オンライン対戦で CPU 対戦設定から独立して使う標準ルール。
+/// ランダムマッチと通常のルームマッチの初期値をサーバー側で統一する。
+pub const ONLINE_DEFAULT_MATCH_SETTING: &str = r#"{"holdEnabled":true,"b2bBonus":true,"garbageMultiplier":1.0,"marginTime":96,"garbageHoleRate":70,"garbageDamageOnClear":true,"ojamaRate":70}"#;
+
+fn validate_match_setting(setting: &str) -> Result<(), String> {
+    let value: serde_json::Value = serde_json::from_str(setting)
+        .map_err(|_| "Match setting must be valid JSON".to_string())?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| "Match setting must be a JSON object".to_string())?;
+
+    for key in object.keys() {
+        if !matches!(
+            key.as_str(),
+            "holdEnabled"
+                | "b2bBonus"
+                | "garbageMultiplier"
+                | "marginTime"
+                | "garbageHoleRate"
+                | "garbageDamageOnClear"
+                | "ojamaRate"
+        ) {
+            return Err(format!("Unknown match setting: {key}"));
+        }
+    }
+
+    for key in ["holdEnabled", "b2bBonus", "garbageDamageOnClear"] {
+        if let Some(value) = object.get(key) {
+            if !value.is_boolean() {
+                return Err(format!("{key} must be a boolean"));
+            }
+        }
+    }
+
+    for (key, min, max) in [
+        ("garbageMultiplier", 0.0, 3.0),
+        ("marginTime", 0.0, 300.0),
+        ("garbageHoleRate", 0.0, 100.0),
+        ("ojamaRate", 0.0, 200.0),
+    ] {
+        if let Some(value) = object.get(key) {
+            let number = value
+                .as_f64()
+                .ok_or_else(|| format!("{key} must be a number"))?;
+            if !number.is_finite() || number < min || number > max {
+                return Err(format!("{key} must be between {min} and {max}"));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// ランダムマッチの結果。待機列に入ったか、相手とマッチしてルームができたか。
 pub enum MatchResult {
     Waiting,
@@ -186,6 +238,29 @@ impl Game {
         if let Some(entry) = room.players.iter_mut().find(|(pid, _, _)| pid == player_id) {
             entry.2 = rule;
         }
+        Ok(())
+    }
+
+    /// 部屋主が対戦前にルール設定を更新する。設定変更は READY を無効化する。
+    pub fn update_match_setting(
+        &mut self,
+        player_id: &Uuid,
+        room_id: Uuid,
+        setting: String,
+    ) -> Result<(), String> {
+        validate_match_setting(&setting)?;
+        let room = self
+            .rooms
+            .get_mut(&room_id)
+            .ok_or_else(|| "Room not found".to_string())?;
+        if room.owner != *player_id {
+            return Err("Only the room owner can change match settings".to_string());
+        }
+        if room.status != RoomStatus::Waiting {
+            return Err("Cannot change match settings after the match has started".to_string());
+        }
+        room.match_setting = setting;
+        room.ready_players.clear();
         Ok(())
     }
 
@@ -535,7 +610,7 @@ impl Game {
             is_public,
             tags,
             code: code.clone(),
-            match_setting: "{}".to_string(),
+            match_setting: ONLINE_DEFAULT_MATCH_SETTING.to_string(),
             alive_players: vec![],
             ready_players: vec![],
             pings: std::collections::HashMap::new(),
@@ -733,5 +808,43 @@ mod tests {
             matches!(game.record_game_over(&b), WinnerStatus::MatchContinues),
             "post-resolution gameOver must be ignored (no draw)"
         );
+    }
+
+    #[test]
+    fn match_setting_is_owner_only_and_clears_ready_players() {
+        let mut game = Game::default();
+        let owner = Uuid::new_v4();
+        let guest = Uuid::new_v4();
+        let (room_id, _code) = game.new_room(
+            owner,
+            "settings".to_string(),
+            2,
+            false,
+            vec![],
+            "owner".to_string(),
+            "tet".to_string(),
+        );
+        game.add_player_to_room(room_id, guest, "guest".to_string(), "tet".to_string())
+            .expect("guest joins");
+        game.rooms.get_mut(&room_id).unwrap().ready_players = vec![owner, guest];
+
+        let setting = r#"{"holdEnabled":false,"b2bBonus":true,"garbageMultiplier":1.5,"marginTime":96,"garbageHoleRate":70,"garbageDamageOnClear":true,"ojamaRate":70}"#;
+        assert!(game
+            .update_match_setting(&owner, room_id, setting.to_string())
+            .is_ok());
+        let room = game.rooms.get(&room_id).unwrap();
+        assert_eq!(room.match_setting, setting);
+        assert!(room.ready_players.is_empty());
+
+        assert!(game
+            .update_match_setting(&guest, room_id, setting.to_string())
+            .is_err());
+        assert!(game
+            .update_match_setting(
+                &owner,
+                room_id,
+                r#"{"garbageMultiplier":99}"#.to_string(),
+            )
+            .is_err());
     }
 }
