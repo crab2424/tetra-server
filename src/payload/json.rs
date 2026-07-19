@@ -118,6 +118,8 @@ json_message!(
         UpdateMatchSettingNotification, (room_id, Uuid), (setting, String);
         UpdatePlayerRuleRequest, (id, Uuid), (room_id, Uuid), (rule, String);
         UpdatePlayerRuleResponse, (id, Uuid), (success, bool), (message, Option<String>);
+        UpdatePlayerNameRequest, (id, Uuid), (room_id, Option<Uuid>), (username, String);
+        UpdatePlayerNameResponse, (id, Uuid), (success, bool), (message, Option<String>);
         PauseRequest, (id, Uuid), (room_id, Uuid);
         PauseNotification, (room_id, Uuid), (paused_by, Uuid);
         ResumeRequest, (id, Uuid), (room_id, Uuid);

@@ -4,7 +4,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, error, info};
 
 use crate::connection::common::{
-    broadcast_json, disconnect_player, notify_room, relay_match_frame,
+    broadcast_json, disconnect_player, notify_room, relay_match_frame, spawn_close_channels,
 };
 use crate::game::{Game, MatchResult, WinnerStatus};
 use crate::payload;
@@ -126,7 +126,9 @@ pub async fn handle_reliable_connection(
                         };
                         *state = crate::game::ConnectionState::Disconnected;
                     }
-                    game.remove_connection(&id);
+                    let (rel, unrel) = game.remove_connection(&id);
+                    drop(game);
+                    spawn_close_channels(id, rel, unrel);
                 }
                 payload::Opcode::JSONRequestPayload => {
                     // MARK: JSONRequestPayload
@@ -617,6 +619,28 @@ pub async fn handle_reliable_connection(
 
                                 if result.is_ok() {
                                     notify_room(&game, room_id).await;
+                                }
+                            }
+
+                            payload::JsonMessage::JSONUpdatePlayerNameRequest(req) => {
+                                let req_id = req.id;
+                                let room_id = req.room_id;
+                                let username = req.username;
+
+                                let result =
+                                    game.write().await.update_player_username(&id, username);
+
+                                jsend!(dc_clone, JSONUpdatePlayerNameResponse {
+                                    id: req_id,
+                                    success: result.is_ok(),
+                                    message: result.clone().err()
+                                });
+
+                                // 在室中の変更のみ全員の表示更新が要る（待機列中は通知先が無い）
+                                if result.is_ok() {
+                                    if let Some(room_id) = room_id {
+                                        notify_room(&game, room_id).await;
+                                    }
                                 }
                             }
 

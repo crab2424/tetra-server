@@ -1,6 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
-use tracing::{debug, error, info};
+use tracing::{debug, info};
 use uuid::Uuid;
 use webrtc::data_channel::RTCDataChannel;
 
@@ -110,8 +110,16 @@ impl Game {
         }
     }
 
-    /// プレイヤーを Game の内部状態（接続表・待機列・経路表）から取り除き，クローズする
-    pub fn remove_connection(&mut self, player_id: &Uuid) {
+    /// プレイヤーを Game の内部状態（接続表・待機列・経路表）から取り除き、
+    /// close すべきチャンネルを返す。
+    /// この場で `close().await` してしまうと Game のロックを保持したまま
+    /// 待つことになり、全 Game 操作がブロックされる。よってクローズは
+    /// 呼び出し側でロックを解放した後に `tokio::spawn` で行う責務とする。
+    #[must_use]
+    pub fn remove_connection(
+        &mut self,
+        player_id: &Uuid,
+    ) -> (Option<Arc<RTCDataChannel>>, Option<Arc<RTCDataChannel>>) {
         let channels: (Option<Arc<RTCDataChannel>>, Option<Arc<RTCDataChannel>>) = self
             .connections
             .remove(player_id)
@@ -124,26 +132,7 @@ impl Game {
         // 経路表・所属ルームからも退去させる
         self.leave_room(player_id);
 
-        let player_id = *player_id;
-
-        tokio::spawn(async move {
-            if let Some(dc) = channels.0 {
-                if let Err(err) = dc.close().await {
-                    error!(
-                        "Failed to close reliable channel for player {}: {:?}",
-                        player_id, err
-                    );
-                }
-            }
-            if let Some(dc) = channels.1 {
-                if let Err(err) = dc.close().await {
-                    error!(
-                        "Failed to close unreliable channel for player {}: {:?}",
-                        player_id, err
-                    );
-                }
-            }
-        });
+        channels
     }
 
     /// プレイヤーをルームに参加させる（players への追加＋経路表更新）。
@@ -196,6 +185,36 @@ impl Game {
         }
         if let Some(entry) = room.players.iter_mut().find(|(pid, _, _)| pid == player_id) {
             entry.2 = rule;
+        }
+        Ok(())
+    }
+
+    /// プレイヤー自身の表示名を更新する。
+    /// 名前は表示専用なのでルーム状態を問わず許可する（対戦中の変更は次ラウンドから反映）。
+    /// ルーム・待機列のどちらにも居ない場合は、次の参加リクエストで新しい名前が送られる
+    /// ため何もせず成功扱いにする。
+    pub fn update_player_username(
+        &mut self,
+        player_id: &Uuid,
+        username: String,
+    ) -> Result<(), String> {
+        let username = username.trim().to_string();
+        if username.is_empty() || username.chars().count() > 16 {
+            return Err("Name must be 1-16 characters".to_string());
+        }
+        if let Some(room_id) = self.player_rooms.get(player_id).copied() {
+            if let Some(room) = self.rooms.get_mut(&room_id) {
+                if let Some(entry) = room.players.iter_mut().find(|(pid, _, _)| pid == player_id) {
+                    entry.1 = username.clone();
+                }
+            }
+        }
+        if let Some(entry) = self
+            .matchmaking_queue
+            .iter_mut()
+            .find(|(pid, _, _)| pid == player_id)
+        {
+            entry.1 = username;
         }
         Ok(())
     }
@@ -586,8 +605,9 @@ mod tests {
         game.add_player_to_room(room_id, guest, "guest".to_string(), "puyo".to_string())
             .expect("guest should join");
 
-        // 退室させると、接続表からも消えるし，closeもされる．
-        game.remove_connection(&guest);
+        // 退室させると接続表からも消え、close 対象のチャンネル（今回は None／None）を返す
+        let (rel, unrel) = game.remove_connection(&guest);
+        assert!(rel.is_none() && unrel.is_none());
 
         // 経路表・ルームの players から消えている
         assert_eq!(game.room_of(&guest), None);
@@ -596,6 +616,58 @@ mod tests {
         // owner を抜くと無人になりルームごと消える
         let _ = game.remove_connection(&owner);
         assert!(game.rooms.get(&room_id).is_none());
+    }
+
+    /// 表示名の更新: ルーム内・待機列の両方に反映され、
+    /// 空文字や17文字以上は拒否されること、どこにも居なければ no-op 成功になることを確認する。
+    #[test]
+    fn update_player_username_updates_room_and_queue() {
+        let mut game = Game::default();
+        let owner = Uuid::new_v4();
+        let guest = Uuid::new_v4();
+        let queued = Uuid::new_v4();
+        let stranger = Uuid::new_v4();
+
+        let (room_id, _code) = game.new_room(
+            owner,
+            "test".to_string(),
+            2,
+            false,
+            vec![],
+            "owner".to_string(),
+            "tet".to_string(),
+        );
+        game.add_player_to_room(room_id, guest, "guest".to_string(), "puyo".to_string())
+            .expect("guest should join");
+        // 待機列に1人（相手がいないのでキュー入りする）
+        game.random_match(queued, "queued".to_string(), "tet".to_string());
+
+        // 在室プレイヤーの名前が更新される（前後の空白はtrim）
+        game.update_player_username(&guest, "  newname  ".to_string())
+            .expect("rename should succeed");
+        let room = game.rooms.get(&room_id).unwrap();
+        let entry = room.players.iter().find(|(pid, _, _)| *pid == guest);
+        assert_eq!(entry.map(|(_, name, _)| name.as_str()), Some("newname"));
+
+        // 待機列エントリの名前も更新される
+        game.update_player_username(&queued, "qname".to_string())
+            .expect("queued rename should succeed");
+        assert!(
+            game.matchmaking_queue
+                .iter()
+                .any(|(pid, name, _)| *pid == queued && name == "qname")
+        );
+
+        // 空文字・16文字超は拒否
+        assert!(game.update_player_username(&guest, "   ".to_string()).is_err());
+        assert!(
+            game.update_player_username(&guest, "a".repeat(17))
+                .is_err()
+        );
+
+        // どこにも居ないプレイヤーは no-op 成功
+        game.update_player_username(&stranger, "ghost".to_string())
+            .expect("no-op rename should succeed");
     }
 
     /// Issue #8 の核心: Game を RwLock で包むと「読み取りは並行・書き込みは排他」に
