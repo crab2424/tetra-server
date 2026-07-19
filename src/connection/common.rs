@@ -15,6 +15,34 @@ pub const UNRELIABLE_CHANNEL_LABEL: &str = "unreliable-main";
 /// 長くすると復帰しやすくなるが「相手が落ちた→勝ち」確定が遅くなるトレードオフ。
 pub const RECONNECT_GRACE_SECS: u64 = 8;
 
+/// remove_connection が返した close 対象を非同期にクローズする。
+/// ロックを保持したまま `close().await` すると全 Game 操作がブロックされるため、
+/// 呼び出し側でロックを解放してからこの関数を呼ぶ。
+pub fn spawn_close_channels(
+    player_id: Uuid,
+    reliable: Option<Arc<webrtc::data_channel::RTCDataChannel>>,
+    unreliable: Option<Arc<webrtc::data_channel::RTCDataChannel>>,
+) {
+    tokio::spawn(async move {
+        if let Some(dc) = reliable {
+            if let Err(err) = dc.close().await {
+                error!(
+                    "Failed to close reliable channel for player {}: {:?}",
+                    player_id, err
+                );
+            }
+        }
+        if let Some(dc) = unreliable {
+            if let Err(err) = dc.close().await {
+                error!(
+                    "Failed to close unreliable channel for player {}: {:?}",
+                    player_id, err
+                );
+            }
+        }
+    });
+}
+
 /// 0x2N 中継フレームを構築する。送信元UUID(16バイト)をオペコードの直後に挿入する。
 pub fn relay_match_frame(data: &Bytes, sender_id: &uuid::Uuid) -> Bytes {
     let mut out = Vec::with_capacity(1 + 16 + data.len().saturating_sub(1));
@@ -175,7 +203,8 @@ pub async fn disconnect_player(
             None
         };
 
-        game.write().await.remove_connection(&id);
+        let (rel, unrel) = game.write().await.remove_connection(&id);
+        spawn_close_channels(id, rel, unrel);
         warn!("Removed player [{id}] data after 5 seconds of disconnection.");
 
         if let Some(room_id) = room_id {
