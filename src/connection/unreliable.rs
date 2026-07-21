@@ -54,7 +54,7 @@ pub async fn handle_unreliable_connection(
                 return;
             }
 
-            if (0x21..=0x28).contains(&data[0]) {
+            if (0x21..=0x2B).contains(&data[0]) {
                 error!(
                     "Reliable game opcode received on unreliable channel: 0x{:02X}",
                     data[0]

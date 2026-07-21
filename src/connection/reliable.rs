@@ -59,7 +59,7 @@ pub async fn handle_reliable_connection(
 
             // ゲームデータは opcode ごとにチャネルを固定する。Garbage だけは
             // 相手ルール・対戦状態・payload をサーバー側で検証してから中継する。
-            if data[0] >= 0x20 && data[0] <= 0x28 {
+            if data[0] >= 0x20 && data[0] <= 0x2B {
                 if data[0] == payload::Opcode::PieceStatePayload as u8 {
                     error!("PieceState received on reliable channel from player {id}");
                     return;
@@ -85,7 +85,7 @@ pub async fn handle_reliable_connection(
                 return;
             }
 
-            if data[0] >= 0x29 && data[0] <= 0x3F {
+            if data[0] >= 0x2C && data[0] <= 0x3F {
                 error!("Unknown game opcode on reliable channel: 0x{:02X}", data[0]);
                 return;
             }

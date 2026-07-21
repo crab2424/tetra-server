@@ -92,5 +92,8 @@ schemas! {
         MatchGameOver, 0x26, (data, Vec<u8>);
         ChainReplay, 0x27, (data, Vec<u8>);
         SE, 0x28, (data, Vec<u8>);
+        PendingUpdate, 0x29, (data, Vec<u8>);
+        HoldState, 0x2A, (data, Vec<u8>);
+        StatsUpdate, 0x2B, (data, Vec<u8>);
     }
 }
