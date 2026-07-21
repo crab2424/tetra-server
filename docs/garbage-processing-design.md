@@ -139,7 +139,7 @@ CPU送信経路      -> 相手の GarbageQueue.enqueue()
 | ChainReplay | `0x27` | reliable |
 | SE | `0x28` | reliable |
 
-現在のドキュメントと `testclient` は `0x06`／`0x07` の旧形式を使用しているため、実装前に更新する。
+旧形式の `0x06`／`0x07` は使用せず、ドキュメントと `testclient` も `0x20..0x28` に統一する。
 
 Garbage payload は少なくとも以下を満たす。
 

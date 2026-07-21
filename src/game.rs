@@ -1,10 +1,56 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use tracing::{debug, info};
 use uuid::Uuid;
 use webrtc::data_channel::RTCDataChannel;
 
 use crate::room::{Room, RoomStatus};
+
+pub const GARBAGE_PROTOCOL_VERSION: u8 = 1;
+pub const MAX_GARBAGE_AMOUNT: usize = 1_000;
+pub const MAX_GARBAGE_FRAME_BYTES: usize = 1 + 1 + 2 + MAX_GARBAGE_AMOUNT;
+pub const GARBAGE_RATE_LIMIT: usize = 60;
+pub const GARBAGE_RATE_WINDOW_SECS: u64 = 1;
+
+/// Garbage 本体を検証し、受信側ルールに応じた穴/列の値を返す。
+pub fn validate_garbage_payload(body: &[u8], receiver_rule: &str) -> Result<(), String> {
+    if body.len() < 3 {
+        return Err("Garbage payload is too short".to_string());
+    }
+    if body[0] != GARBAGE_PROTOCOL_VERSION {
+        return Err(format!("Unsupported Garbage version: {}", body[0]));
+    }
+
+    let amount = u16::from_le_bytes([body[1], body[2]]) as usize;
+    if amount == 0 {
+        return Err("Garbage amount must be greater than zero".to_string());
+    }
+    if amount > MAX_GARBAGE_AMOUNT {
+        return Err(format!(
+            "Garbage amount exceeds maximum: {MAX_GARBAGE_AMOUNT}"
+        ));
+    }
+    let expected_len = 3 + amount;
+    if body.len() != expected_len {
+        return Err(format!(
+            "Garbage amount does not match holes length: amount={amount}, holes={}",
+            body.len().saturating_sub(3)
+        ));
+    }
+
+    let max_value = match receiver_rule {
+        "tet" => 9,
+        "puyo" => 5,
+        _ => return Err("Invalid receiver rule".to_string()),
+    };
+    if body[3..].iter().any(|hole| *hole > max_value) {
+        return Err(format!(
+            "Garbage hole/column must be between 0 and {max_value}"
+        ));
+    }
+    Ok(())
+}
 
 /// オンライン対戦で CPU 対戦設定から独立して使う標準ルール。
 /// ランダムマッチと通常のルームマッチの初期値をサーバー側で統一する。
@@ -100,6 +146,8 @@ pub struct Game {
     room_codes: HashMap<String, Uuid>,
     /// ランダムマッチの待機列（FIFO）。(player_id, username, rule)。
     matchmaking_queue: VecDeque<(Uuid, String, String)>,
+    /// Garbage の送信時刻。古い時刻を捨てながらプレイヤー単位でレート制限する。
+    garbage_sent_at: HashMap<Uuid, VecDeque<Instant>>,
 }
 
 impl Default for Game {
@@ -110,6 +158,7 @@ impl Default for Game {
             player_rooms: HashMap::new(),
             room_codes: HashMap::new(),
             matchmaking_queue: VecDeque::new(),
+            garbage_sent_at: HashMap::new(),
         }
     }
 }
@@ -181,6 +230,7 @@ impl Game {
         // 待機列からも除外
         self.matchmaking_queue
             .retain(|(pid, _, _)| pid != player_id);
+        self.garbage_sent_at.remove(player_id);
         // 経路表・所属ルームからも退去させる
         self.leave_room(player_id);
 
@@ -466,6 +516,72 @@ impl Game {
             .collect()
     }
 
+    /// 対戦中かつ生存している相手の reliable チャンネルだけを返す。
+    pub fn get_live_opponent_reliable_channels(
+        &self,
+        player_id: &Uuid,
+    ) -> Vec<Arc<webrtc::data_channel::RTCDataChannel>> {
+        let Some(room_id) = self.player_rooms.get(player_id) else {
+            return vec![];
+        };
+        let Some(room) = self.rooms.get(room_id) else {
+            return vec![];
+        };
+        if room.status != RoomStatus::Playing || !room.alive_players.contains(player_id) {
+            return vec![];
+        }
+        room.players
+            .iter()
+            .filter(|(pid, _, _)| *pid != *player_id && room.alive_players.contains(pid))
+            .filter_map(|(pid, _, _)| self.get_reliable_connection(pid))
+            .collect()
+    }
+
+    /// Garbage を中継してよい状態か検証し、送信レートも記録する。
+    pub fn validate_garbage(&mut self, player_id: &Uuid, body: &[u8]) -> Result<(), String> {
+        if body.len() + 1 > MAX_GARBAGE_FRAME_BYTES {
+            return Err(format!(
+                "Garbage frame exceeds {MAX_GARBAGE_FRAME_BYTES} bytes"
+            ));
+        }
+        let room_id = self
+            .player_rooms
+            .get(player_id)
+            .copied()
+            .ok_or_else(|| "Garbage sender is not in a room".to_string())?;
+        let room = self
+            .rooms
+            .get(&room_id)
+            .ok_or_else(|| "Garbage room not found".to_string())?;
+        if room.status != RoomStatus::Playing {
+            return Err("Garbage is only accepted during a match".to_string());
+        }
+        if !room.alive_players.contains(player_id) {
+            return Err("Garbage sender is no longer alive".to_string());
+        }
+        let receiver_rules: Vec<&str> = room
+            .players
+            .iter()
+            .filter(|(pid, _, _)| *pid != *player_id && room.alive_players.contains(pid))
+            .map(|(_, _, rule)| rule.as_str())
+            .collect();
+        if receiver_rules.is_empty() {
+            return Err("Garbage has no live opponent".to_string());
+        }
+        for rule in receiver_rules {
+            validate_garbage_payload(body, rule)?;
+        }
+
+        let now = Instant::now();
+        let sent = self.garbage_sent_at.entry(*player_id).or_default();
+        sent.retain(|at| now.duration_since(*at).as_secs() < GARBAGE_RATE_WINDOW_SECS);
+        if sent.len() >= GARBAGE_RATE_LIMIT {
+            return Err("Garbage rate limit exceeded".to_string());
+        }
+        sent.push_back(now);
+        Ok(())
+    }
+
     /// ルーム全メンバーの reliable チャンネルを収集する（通知配布用）。
     pub fn get_room_reliable_channels(&self, room_id: &Uuid) -> Vec<Arc<RTCDataChannel>> {
         let Some(room) = self.rooms.get(room_id) else {
@@ -627,6 +743,65 @@ mod tests {
     use super::*;
     use tokio::sync::RwLock;
 
+    fn garbage_payload(holes: &[u8]) -> Vec<u8> {
+        let mut body = vec![GARBAGE_PROTOCOL_VERSION];
+        body.extend_from_slice(&(holes.len() as u16).to_le_bytes());
+        body.extend_from_slice(holes);
+        body
+    }
+
+    #[test]
+    fn garbage_payload_is_validated_for_receiver_rule() {
+        assert!(validate_garbage_payload(&garbage_payload(&[0, 9]), "tet").is_ok());
+        assert!(validate_garbage_payload(&garbage_payload(&[0, 5]), "puyo").is_ok());
+        assert!(validate_garbage_payload(&garbage_payload(&[10]), "tet").is_err());
+        assert!(validate_garbage_payload(&garbage_payload(&[6]), "puyo").is_err());
+    }
+
+    #[test]
+    fn garbage_payload_rejects_version_length_and_amount_errors() {
+        assert!(validate_garbage_payload(&garbage_payload(&[]), "tet").is_err());
+
+        let mut wrong_version = garbage_payload(&[0]);
+        wrong_version[0] = 2;
+        assert!(validate_garbage_payload(&wrong_version, "tet").is_err());
+
+        let mut wrong_length = garbage_payload(&[0, 1]);
+        wrong_length[1..3].copy_from_slice(&3u16.to_le_bytes());
+        assert!(validate_garbage_payload(&wrong_length, "tet").is_err());
+
+        let mut too_large = vec![GARBAGE_PROTOCOL_VERSION];
+        too_large.extend_from_slice(&((MAX_GARBAGE_AMOUNT + 1) as u16).to_le_bytes());
+        too_large.resize(3 + MAX_GARBAGE_AMOUNT + 1, 0);
+        assert!(validate_garbage_payload(&too_large, "tet").is_err());
+    }
+
+    #[test]
+    fn garbage_is_only_accepted_for_live_players_in_playing_room() {
+        let mut game = Game::default();
+        let owner = Uuid::new_v4();
+        let guest = Uuid::new_v4();
+        let (room_id, _) = game.new_room(
+            owner,
+            "test".to_string(),
+            2,
+            false,
+            vec![],
+            "owner".to_string(),
+            "tet".to_string(),
+        );
+        game.add_player_to_room(room_id, guest, "guest".to_string(), "puyo".to_string())
+            .unwrap();
+        let body = garbage_payload(&[0]);
+
+        assert!(game.validate_garbage(&owner, &body).is_err());
+        game.set_ready(&guest, true).unwrap();
+        game.start_match(room_id).unwrap();
+        assert!(game.validate_garbage(&owner, &body).is_ok());
+        game.record_game_over(&owner);
+        assert!(game.validate_garbage(&owner, &body).is_err());
+    }
+
     /// 中継ホットパス(get_opponent_channel)が依存する経路引き get_opponent が
     /// 正しく相手を返すこと、退室で経路が消えることを確認する。
     #[test]
@@ -734,11 +909,11 @@ mod tests {
         );
 
         // 空文字・16文字超は拒否
-        assert!(game.update_player_username(&guest, "   ".to_string()).is_err());
         assert!(
-            game.update_player_username(&guest, "a".repeat(17))
+            game.update_player_username(&guest, "   ".to_string())
                 .is_err()
         );
+        assert!(game.update_player_username(&guest, "a".repeat(17)).is_err());
 
         // どこにも居ないプレイヤーは no-op 成功
         game.update_player_username(&stranger, "ghost".to_string())
@@ -829,22 +1004,21 @@ mod tests {
         game.rooms.get_mut(&room_id).unwrap().ready_players = vec![owner, guest];
 
         let setting = r#"{"holdEnabled":false,"b2bBonus":true,"garbageMultiplier":1.5,"marginTime":96,"garbageHoleRate":70,"garbageDamageOnClear":true,"ojamaRate":70}"#;
-        assert!(game
-            .update_match_setting(&owner, room_id, setting.to_string())
-            .is_ok());
+        assert!(
+            game.update_match_setting(&owner, room_id, setting.to_string())
+                .is_ok()
+        );
         let room = game.rooms.get(&room_id).unwrap();
         assert_eq!(room.match_setting, setting);
         assert!(room.ready_players.is_empty());
 
-        assert!(game
-            .update_match_setting(&guest, room_id, setting.to_string())
-            .is_err());
-        assert!(game
-            .update_match_setting(
-                &owner,
-                room_id,
-                r#"{"garbageMultiplier":99}"#.to_string(),
-            )
-            .is_err());
+        assert!(
+            game.update_match_setting(&guest, room_id, setting.to_string())
+                .is_err()
+        );
+        assert!(
+            game.update_match_setting(&owner, room_id, r#"{"garbageMultiplier":99}"#.to_string(),)
+                .is_err()
+        );
     }
 }

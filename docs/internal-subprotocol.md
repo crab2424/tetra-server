@@ -1,6 +1,6 @@
 # 内部サブプロトコル v1（クライアント間合意）
 
-オンライン対戦（B方式：ライブ状態ストリーミング）で、**クライアント同士が `GameEvent` / `PieceState` の `data` バイト列に載せる中身**の仕様。
+オンライン対戦（B方式：ライブ状態ストリーミング）で、**クライアント同士がゲーム opcode の `data` バイト列に載せる中身**の仕様。
 サーバー（VPS WebRTC リレー）は `data` を**解釈せず相手の同種チャンネルへ素通し**するため、この仕様は Rust 側の変更なしに改訂できる（バージョンは開始ハンドシェイクで交渉。後述）。
 
 設計の前提・経緯は本体メモリ `project-online-design` / `project-tetra-server` を参照。
@@ -18,10 +18,10 @@
 
 | Opcode | 名前 | チャンネル | 用途 |
 |---|---|---|---|
-| `0x06` | `GameEvent` | reliable | 離散イベント（順序保証・欠落不可） |
-| `0x07` | `PieceState` | unreliable | 落下ピース座標の高頻度ストリーム（最新優先・欠落OK） |
+| `0x20` | `PieceState` | unreliable | 落下ピース座標の高頻度ストリーム（最新優先・欠落OK） |
+| `0x21..0x28` | ゲームイベント | reliable | 離散イベント（順序保証・欠落不可） |
 
-サーバーは受信した `0x06`/`0x07` フレームを相手の同種チャンネルへ中身解釈せず転送する。
+サーバーは `0x20` を unreliable、`0x21..0x28` を reliable でのみ受け付け、相手の同種チャンネルへ中継する。`0x24 Garbage` はサーバーが payload を検証する。
 開始/ルーム/再戦/rule通知などサーバーが発番する性質のものは **JSON 層（`payload/json.rs`）**で扱い、本サブプロトコルには含めない。
 
 ## 2. 共通エンコード規約
@@ -31,7 +31,7 @@
 - `t:u32` = GameStart 相対ミリ秒。受信側は初回到着で `offset = localArrival − t` を確定し、以後 `t + offset + buffer` で再生（buffer ≈ 片道遅延 + 30〜60ms ジッタ）。
 - 盤面セルは 1 セル 1 バイト（後述）。
 
-## 3. PieceState（`0x07`・unreliable・30〜60Hz）
+## 3. PieceState（`0x20`・unreliable・30〜60Hz）
 
 サブタグ無し（単一用途）。色は載せない（テトは type で既知、ぷよは直近 Spawn で既知）。
 
@@ -47,7 +47,7 @@
 
 受信側は前後サンプルを線形補間して滑らかに描画する。
 
-## 4. GameEvent（`0x06`・reliable）
+## 4. ゲームイベント（`0x21..0x28`・reliable）
 
 先頭 1 バイト = **サブタグ**、その直後に共通 `t:u32`、以降ボディ。
 
@@ -56,10 +56,11 @@
 | `0x01` | Spawn | テト: `type:u8`, `nextCount:u8`, `next:u8×nextCount` ／ ぷよ: `pivotColor:u8`, `childColor:u8`, `nextCount:u8`, `next:(u8,u8)×nextCount` |
 | `0x02` | Lock | 盤面スナップショット（§5）。**設置ごと=定期補正を兼ねる** |
 | `0x03` | Clear | テト: `rows:u8`, `rowIdx:u8×rows`, `flags:u8`(bit0 B2B / bit1 PC / bit2 T-spin) ／ ぷよ: `chain:u8`, `clearedCells:u8`（演出キュー用・**任意**。盤面は Lock が権威） |
-| `0x04` | **GarbageSend ★ゲーム影響** | `amount:u16`, `holes:u8×amount`（各おじゃま単位の穴/列。テト=各行の穴列 0–9、ぷよ=各おじゃまの列） |
+| `0x24` | **Garbage ★ゲーム影響** | `version:u8(=1)`, `amount:u16`, `holes:u8×amount`（各おじゃま単位の穴/列。テト=各行の穴列 0–9、ぷよ=各おじゃまの列） |
 | `0x05` | Hold | `heldType:u8`（テトのみ） |
-| `0x06` | PendingUpdate | `ready:u16`, `unready:u16`（相手の予告ゲージ表示用・フェーズ別。ready=確定/降下可段, unready=猶予段。いずれも internal 非表示段は除外） |
-| `0x07` | GameOver | `result:u8`（0=topout/負, 1=clear/勝） |
+| `0x26` | GameOver | `result:u8`（0=topout/負, 1=clear/勝） |
+| `0x27` | ChainReplay | 連鎖再生データ |
+| `0x28` | SE | `seId:u8` |
 | `0x08` | **Control（開始/再戦合意・ルール変更）** | `action:u8`, `seed:u32`。`action`=`0x01 READY`（開始/再戦の準備完了。`seed`=共有シード素材）/`0x02 UNREADY`（準備取消・`seed` 未使用）/`0x03 RULE`（在室中のルール変更通知。`seed`=ルールコード `0=tet` / `1=puyo`） |
 | `0x09` | LockChain（ぷよ連鎖起点盤面） | `board:u8×102`（ぷよ盤面 §5）。**ぷよ専用**。連鎖判定の直前＝操作ぷよ確定盤面（`fixWait5f→checkErase` 遷移）を 1 回送る。受信側パペットはこの盤面から連鎖を**自前で再生**（実 PuyoGame の連鎖状態機械を駆動＝点滅/連鎖文字/落下/連鎖SEを完全再現） |
 | `0x0a` | SE（離散SE発音同期） | `seId:u8`（`1`=puyo_fix）。盤面イベントから独立して「この音を今鳴らす」を相手へ送る。発音タイミングが盤面スナップショット（Lock/LockChain＝固定アニメ後で遅れる）とずれる音に使う。ぷよ設置音はペア着地（`_fixPuyo`/split 着地）の瞬間に送り、受信側は即 `playSe` |
@@ -107,7 +108,7 @@ GameStart（JSON 層・サーバー発番）に `protocolVersion`（この文書
 - **コーデック**: `tetra-server/testclient/subprotocol.js`（クラシック script・依存なし・グローバル `Subprotocol`）。
   この仕様の encode/decode を全フレーム分実装した正準実装。本体(TETLABO)へはこのファイルをそのまま流用して `src/online/` 等へ配置する想定（step5）。
   - PieceState: `encodePieceStateTet/Puyo`, `decodePieceState(data, rule)`
-  - GameEvent: `encodeSpawnTet/Puyo`, `encodeLockTet/Puyo`, `encodeClearTet/Puyo`, `encodeGarbage`, `encodeHold`, `encodePending`, `encodeGameOver`, `decodeGameEvent(data, rule)`
+  - GameEvent: `encodeSpawnTet/Puyo`, `encodeLockTet/Puyo`, `encodeClearTet/Puyo`, `encodeGarbagePayload`, `encodeHold`, `encodePending`, `encodeGameOver`, `decodeGameEvent(data, rule)`
   - 盤面ビルダ: `buildTetBoard(blocks)`（field.blocks → 400B、上方バッファ込み）, `buildPuyoBoard(field)`（17×6 → 102B）／逆変換 `tetBoardToBlocks(board)`（y は実座標で復元・負yブロック保持）, `puyoBoardToField(board)`
-  - 各 encode は **opcode を除いた data 部**を返す。呼び出し側が先頭に `0x06`/`0x07` を付けて該当チャンネルへ送る。
+  - 各 encode は **opcode を除いた data 部**を返す。呼び出し側が先頭に `0x20`〜`0x28` を付けて該当チャンネルへ送る。
 - **テストクライアント**: `tetra-server/testclient/index.html` がこのコーデックを使用。2タブで接続→同室化後、tet/ぷよを切替えて各フレームを送信し、相手タブが復号して人間可読表示する（リレー越しの実バイト送受信を検証可能）。「自分のrule」=送信エンコード、「相手のrule」=受信デコード。

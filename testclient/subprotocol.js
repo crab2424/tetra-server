@@ -2,7 +2,7 @@
 // 内部サブプロトコル v1 コーデック（クライアント間合意）
 // 仕様: tetra-server/docs/internal-subprotocol.md
 //
-// このファイルは「GameEvent(0x06) / PieceState(0x07) の data 部（=opcode を除いた中身）」
+// このファイルはゲーム opcode（0x20〜0x28）の data 部（=opcode を除いた中身）
 // のみを encode/decode する純粋ロジック。トランスポート（先頭 opcode 付与・チャンネル選択）
 // は呼び出し側の責務。
 //
@@ -128,7 +128,7 @@
   }
 
   // ──────────────────────────────────────────
-  // PieceState（0x07・unreliable・サブタグ無し・仕様 §3）
+  // PieceState（0x20・unreliable・サブタグ無し・仕様 §3）
   //   テト: t:u32, type:u8, x:i8, y:i8, rot:u8                → 8B
   //   ぷよ: t:u32, pivotX:i8, pivotY2:i8(=pivotY*2), orient:u8 → 7B
   // 色は載せない（受信側は直近 Spawn で既知）。
@@ -157,7 +157,7 @@
   }
 
   // ──────────────────────────────────────────
-  // GameEvent（0x06・reliable・先頭1B=サブタグ + t:u32 + ボディ・仕様 §4）
+  // 旧 GameEvent codec（現在の transport opcode は 0x21〜0x28）
   // ──────────────────────────────────────────
 
   // Spawn ── テト: type, nextCount, next[] / ぷよ: pivotColor, childColor, nextCount, next[(a,b)]
@@ -196,7 +196,34 @@
     return new Writer(7).u8(EV.CLEAR).u32(t).u8(chain).u8(clearedCells).finish();
   }
 
-  // GarbageSend ── ★ゲーム影響: amount:u16, holes:u8[amount]
+  // Garbage payload（0x24/reliable）── version:u8, amount:u16, holes:u8[amount]
+  function encodeGarbagePayload({ amount, holes = [] }) {
+    if (amount !== holes.length || amount < 1 || amount > 1000) {
+      throw new Error('Garbage amount must match 1..1000 holes');
+    }
+    const w = new Writer(3 + holes.length).u8(1).u16(amount);
+    for (const h of holes) w.u8(h);
+    return w.finish();
+  }
+
+  function decodeGarbagePayload(data, rule) {
+    const r = new Reader(data);
+    if (r.remaining < 3 || r.u8() !== 1) throw new Error('Unsupported Garbage payload');
+    const amount = r.u16();
+    if (amount < 1 || amount > 1000 || r.remaining !== amount) {
+      throw new Error('Invalid Garbage amount/length');
+    }
+    const max = rule === 'puyo' ? 5 : 9;
+    const holes = [];
+    for (let i = 0; i < amount; i++) {
+      const h = r.u8();
+      if (h > max) throw new Error(`Garbage hole/column out of range: ${h}`);
+      holes.push(h);
+    }
+    return { kind: 'garbage', amount, holes };
+  }
+
+  // 旧 GameEvent codec 互換用。新しい送信経路では encodeGarbagePayload を使う。
   function encodeGarbage({ t, amount, holes = [] }) {
     const w = new Writer(7 + holes.length).u8(EV.GARBAGE).u32(t).u16(amount);
     for (const h of holes) w.u8(h);
@@ -371,7 +398,8 @@
     encodeSpawnTet, encodeSpawnPuyo,
     encodeLockTet, encodeLockPuyo,
     encodeClearTet, encodeClearPuyo,
-    encodeGarbage, encodeHold, encodePending, encodeGameOver, encodeControl,
+    encodeGarbage, encodeGarbagePayload, decodeGarbagePayload,
+    encodeHold, encodePending, encodeGameOver, encodeControl,
     encodeLockChainPuyo, encodeSe,
     // GameEvent decoder
     decodeGameEvent,

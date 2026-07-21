@@ -38,8 +38,9 @@ pub async fn handle_unreliable_connection(
                 return;
             }
 
-            // 0x2N/0x3N: 対戦中ゲームデータ（PieceState 高頻度）。送信元UUID付与して同室全員へ中継。
-            if data[0] >= 0x20 && data[0] <= 0x3F {
+            // unreliable は PieceState 専用。reliable 専用イベント、とくに Garbage は
+            // ここから受け付けない。
+            if data[0] == payload::Opcode::PieceStatePayload as u8 {
                 let relayed = relay_match_frame(&msg.data, &id);
                 let peer_dcs = game.read().await.get_room_peer_channels(&id, false);
                 for dc in peer_dcs {
@@ -50,6 +51,14 @@ pub async fn handle_unreliable_connection(
                         );
                     }
                 }
+                return;
+            }
+
+            if (0x21..=0x28).contains(&data[0]) {
+                error!(
+                    "Reliable game opcode received on unreliable channel: 0x{:02X}",
+                    data[0]
+                );
                 return;
             }
 

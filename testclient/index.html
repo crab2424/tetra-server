@@ -211,7 +211,21 @@ function handleIncoming(chName, bytes) {
     handleJsonResponse(JSON.parse(json));
     return;
   }
-  if (op === 0x06) { // GameEvent
+  if (op === 0x24) { // Garbage (reliable)
+    const oppRule = $("oppRule").value;
+    try {
+      const g = Subprotocol.decodeGarbagePayload(bytes.subarray(1), oppRule);
+      log(`← [中継] Garbage / amount=${g.amount} / holes=[${g.holes}]`, "relay");
+    } catch (e) {
+      log(`← Garbage 復号失敗(${oppRule}): ${e.message}`, "err");
+    }
+    return;
+  }
+  if (op >= 0x21 && op <= 0x28) { // reliable game event
+    log(`← [中継] reliable game opcode=0x${op.toString(16)}`, "relay");
+    return;
+  }
+  if (op === 0x06) { // legacy GameEvent
     const oppRule = $("oppRule").value;
     try {
       const ev = Subprotocol.decodeGameEvent(bytes.subarray(1), oppRule);
@@ -221,7 +235,7 @@ function handleIncoming(chName, bytes) {
     }
     return;
   }
-  if (op === 0x07) { // PieceState
+  if (op === 0x20) { // PieceState
     const oppRule = $("oppRule").value;
     try {
       const ps = Subprotocol.decodePieceState(bytes.subarray(1), oppRule);
@@ -354,11 +368,11 @@ function resetClock() { gameStartT = Date.now(); log("t=0 (GameStart) にリセ�
 
 // reliable/unreliable に opcode 付きフレームを送る
 function sendGameEvent(data) {
-  const f = new Uint8Array(1 + data.length); f[0] = 0x06; f.set(data, 1);
+  const f = new Uint8Array(1 + data.length); f[0] = 0x21; f.set(data, 1);
   reliable.send(f);
 }
 function sendPieceFrame(data) {
-  const f = new Uint8Array(1 + data.length); f[0] = 0x07; f.set(data, 1);
+  const f = new Uint8Array(1 + data.length); f[0] = 0x20; f.set(data, 1);
   unreliable.send(f);
 }
 
@@ -442,9 +456,13 @@ function evClear() {
 function evGarbage() {
   const t = nowT();
   const amount = 1 + Math.floor(Math.random() * 6);
-  const holes = Array.from({ length: amount }, () => Math.floor(Math.random() * 10));
-  const data = Subprotocol.encodeGarbage({ t, amount, holes });
-  sendGameEvent(data); log(`→ ★GarbageSend ${data.length}B amount=${amount} holes=[${holes}]`, "info");
+  const rule = $("oppRule").value;
+  const max = rule === "puyo" ? 5 : 9;
+  const holes = Array.from({ length: amount }, () => Math.floor(Math.random() * (max + 1)));
+  const data = Subprotocol.encodeGarbagePayload({ amount, holes });
+  const f = new Uint8Array(1 + data.length); f[0] = 0x24; f.set(data, 1);
+  reliable.send(f);
+  log(`→ ★GarbageSend ${data.length}B amount=${amount} holes=[${holes}]`, "info");
 }
 function evHold() { const t = nowT(); sendGameEvent(Subprotocol.encodeHold({ t, heldType: Math.floor(Math.random() * 7) })); log("→ Hold", "info"); }
 function evPending() { const t = nowT(); sendGameEvent(Subprotocol.encodePending({ t, ready: Math.floor(Math.random() * 10), unready: Math.floor(Math.random() * 10) })); log("→ Pending", "info"); }

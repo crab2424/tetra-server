@@ -57,15 +57,36 @@ pub async fn handle_reliable_connection(
                 return;
             }
 
-            // 0x2N/0x3N: 対戦中ゲームデータ。送信元UUID付与して同室全員へ中継（サーバーは内容を解釈しない）。
-            if data[0] >= 0x20 && data[0] <= 0x3F {
+            // ゲームデータは opcode ごとにチャネルを固定する。Garbage だけは
+            // 相手ルール・対戦状態・payload をサーバー側で検証してから中継する。
+            if data[0] >= 0x20 && data[0] <= 0x28 {
+                if data[0] == payload::Opcode::PieceStatePayload as u8 {
+                    error!("PieceState received on reliable channel from player {id}");
+                    return;
+                }
+                if data[0] == payload::Opcode::GarbagePayload as u8 {
+                    let result = game.write().await.validate_garbage(&id, &data[1..]);
+                    if let Err(reason) = result {
+                        error!("Rejected Garbage from player {id}: {reason}");
+                        return;
+                    }
+                }
                 let relayed = relay_match_frame(&msg.data, &id);
-                let peer_dcs = game.read().await.get_room_peer_channels(&id, true);
+                let peer_dcs = if data[0] == payload::Opcode::GarbagePayload as u8 {
+                    game.read().await.get_live_opponent_reliable_channels(&id)
+                } else {
+                    game.read().await.get_room_peer_channels(&id, true)
+                };
                 for dc in peer_dcs {
                     if let Err(e) = dc.send(&relayed).await {
                         error!("Failed to relay match frame 0x{:02X}: {e}", data[0]);
                     }
                 }
+                return;
+            }
+
+            if data[0] >= 0x29 && data[0] <= 0x3F {
+                error!("Unknown game opcode on reliable channel: 0x{:02X}", data[0]);
                 return;
             }
 
