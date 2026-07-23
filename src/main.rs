@@ -44,6 +44,23 @@ macro_rules! nest {
     };
 }
 
+/// Cloudflare TURNが未設定/取得失敗のときに最低限クライアントへ渡すSTUNサーバー一覧。
+/// これが無いと NAT 越しのクライアントは host候補(私有IP)しか集められず、ICEが
+/// 到達可能な候補ペアを1つも作れず無言のまま固まる(2026-07-23に発生した障害の原因)。
+const DEFAULT_STUN_URLS: [&str; 6] = [
+    "stun:stun.cloudflare.com:3478",
+    "stun:stun.l.google.com:19302",
+    "stun:stun1.l.google.com:19302",
+    "stun:stun2.l.google.com:19302",
+    "stun:stun3.l.google.com:19302",
+    "stun:stun4.l.google.com:19302",
+];
+
+/// クライアントへ送る `rtc_peer_ice_config` のフォールバック値(STUNのみ)をJSON文字列で返す。
+fn default_stun_ice_config_json() -> String {
+    serde_json::json!({ "iceServers": [ { "urls": DEFAULT_STUN_URLS } ] }).to_string()
+}
+
 #[derive(Clone)]
 struct AppState {
     game: Arc<RwLock<game::Game>>,
@@ -342,8 +359,16 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         info!("Client authenticated with version: {version}");
 
                         let ice_config: Option<String> = {
-                            let token_id = env::var("CF_TURN_TOKEN_ID").ok();
-                            let token_secret = env::var("CF_TURN_API_TOKEN").ok();
+                            // 空文字列は「未設定」として扱う。env::var は空文字でも Ok("") を返すため、
+                            // .ok() だけだと Environment=CF_TURN_TOKEN_ID= のような空設定でも
+                            // 「設定されている」ルートに入り、Cloudflareへ壊れたリクエストを送って
+                            // 静かに失敗する(TURN/STUNどちらも無い状態でクライアントに渡ってしまう)。
+                            let token_id = env::var("CF_TURN_TOKEN_ID")
+                                .ok()
+                                .filter(|s| !s.is_empty());
+                            let token_secret = env::var("CF_TURN_API_TOKEN")
+                                .ok()
+                                .filter(|s| !s.is_empty());
 
                             if let (Some(id), Some(secret)) = (token_id, token_secret) {
                                 let url = Url::parse(format!("https://rtc.live.cloudflare.com/v1/turn/keys/{}/credentials/generate-ice-servers", id).as_str()).unwrap();
@@ -371,21 +396,24 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                             Some(t)
                                         } else {
                                             error!("Failed to read ICE server response text");
-                                            None
+                                            Some(default_stun_ice_config_json())
                                         }
                                     } else {
                                         error!("Failed to get ICE servers: HTTP {}", r.status());
-                                        None
+                                        Some(default_stun_ice_config_json())
                                     }
                                 } else {
                                     error!(
                                         "Failed to send request for ICE servers: {}",
                                         res.err().unwrap()
                                     );
-                                    None
+                                    Some(default_stun_ice_config_json())
                                 }
                             } else {
-                                None
+                                warn!(
+                                    "CF_TURN_TOKEN_ID/CF_TURN_API_TOKEN not set; falling back to STUN-only ICE config"
+                                );
+                                Some(default_stun_ice_config_json())
                             }
                         };
 
@@ -464,6 +492,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // (大学WIFI等での接続断の主因だった。旧設定は 5s/8s = 13s で機械的に打ち切っていた)。
     // disconnected: 一過性とみなす猶予 / failed: これを過ぎたら終端(Failed) / keepalive: 疎通確認間隔
     let mut s = webrtc::api::setting_engine::SettingEngine::default();
+    // EC2にIPv6の実経路が無い環境だと、ICEエージェントがデフォルトで試みるudp6候補の
+    // 収集が "Network is unreachable" で全滅し、リンクローカルアドレスへのbindも
+    // EINVALで失敗する(実機ログで確認済み)。IPv4のみに絞ってこの無駄な失敗試行と
+    // 収集フェーズの混乱を避ける。
+    s.set_network_types(vec![webrtc::ice::network_type::NetworkType::Udp4]);
     // ICE_UDP_PORT_RANGE="50000-50100" のように指定すると、ICE候補のUDPポートを
     // この範囲に固定する。EC2等でセキュリティグループのUDP開放範囲を絞るために必要。
     // NAT_1TO1_IP にパブリックIP(Elastic IP)を指定すると、host候補をそのIPに
@@ -499,14 +532,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let config = RTCConfiguration {
         ice_servers: vec![RTCIceServer {
-            urls: vec![
-                "stun:stun.cloudflare.com:3478".to_string(),
-                "stun:stun.l.google.com:19302".to_string(),
-                "stun:stun1.l.google.com:19302".to_string(),
-                "stun:stun2.l.google.com:19302".to_string(),
-                "stun:stun3.l.google.com:19302".to_string(),
-                "stun:stun4.l.google.com:19302".to_string(),
-            ],
+            urls: DEFAULT_STUN_URLS.iter().map(|s| s.to_string()).collect(),
             ..Default::default()
         }],
         ..Default::default()
