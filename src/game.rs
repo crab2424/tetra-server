@@ -4,6 +4,7 @@ use std::time::Instant;
 use tracing::{debug, info};
 use uuid::Uuid;
 use webrtc::data_channel::RTCDataChannel;
+use webrtc::data_channel::data_channel_state::RTCDataChannelState;
 
 use crate::room::{Room, RoomStatus};
 
@@ -235,6 +236,55 @@ impl Game {
         self.leave_room(player_id);
 
         channels
+    }
+
+    /// プレイヤーが reliable チャンネルで実際に応答可能かを判定する。
+    /// 接続エントリが無い、または reliable channel が Open でなければ「無応答」とみなす
+    /// （ConnectionState は on_peer_connection_state_change の取りこぼしで更新され損ねる
+    /// ことがあるため、実体である RTCDataChannel の状態を直接見る）。
+    fn is_player_responsive(&self, player_id: &Uuid) -> bool {
+        self.connections
+            .get(player_id)
+            .and_then(|pair| pair.reliable.as_ref())
+            .map(|dc| dc.ready_state() == RTCDataChannelState::Open)
+            .unwrap_or(false)
+    }
+
+    /// 定期スイープ用: 全員のreliableチャンネルが無応答（Open でない）になっているルームを
+    /// まとめて破棄する。PeerConnection の Failed/Closed 遷移を取りこぼして
+    /// disconnect_player が起動しないケースの保険（メモリに残り続けるゾンビ部屋対策）。
+    /// 除去したプレイヤーの (reliable, unreliable) チャンネルを返すので、呼び出し側で
+    /// ロック外で close する。
+    #[must_use]
+    pub fn sweep_unresponsive_rooms(
+        &mut self,
+    ) -> Vec<(Uuid, Option<Arc<RTCDataChannel>>, Option<Arc<RTCDataChannel>>)> {
+        let stale_room_ids: Vec<Uuid> = self
+            .rooms
+            .iter()
+            .filter(|(_, room)| {
+                !room.players.is_empty()
+                    && room
+                        .players
+                        .iter()
+                        .all(|(pid, _, _)| !self.is_player_responsive(pid))
+            })
+            .map(|(room_id, _)| *room_id)
+            .collect();
+
+        let mut closed = Vec::new();
+        for room_id in stale_room_ids {
+            let player_ids: Vec<Uuid> = self
+                .rooms
+                .get(&room_id)
+                .map(|room| room.players.iter().map(|(pid, _, _)| *pid).collect())
+                .unwrap_or_default();
+            for player_id in player_ids {
+                let (reliable, unreliable) = self.remove_connection(&player_id);
+                closed.push((player_id, reliable, unreliable));
+            }
+        }
+        closed
     }
 
     /// プレイヤーをルームに参加させる（players への追加＋経路表更新）。

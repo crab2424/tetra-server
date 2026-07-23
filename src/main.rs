@@ -36,13 +36,17 @@ mod payload;
 mod room;
 mod signaling;
 
-use connection::{handle_reliable_connection, handle_unreliable_connection};
+use connection::{handle_reliable_connection, handle_unreliable_connection, spawn_close_channels};
 
 macro_rules! nest {
     ($($n:ident),+ $(,)?) => {
         $(let $n = std::sync::Arc::clone(&$n);)+
     };
 }
+
+/// ルームの定期無応答スイープの実行間隔(秒)。PeerConnection の Failed/Closed 遷移を
+/// 取りこぼしてゾンビ部屋がメモリに残り続ける問題への保険（game::Game::sweep_unresponsive_rooms）。
+const ROOM_SWEEP_INTERVAL_SECS: u64 = 60;
 
 /// Cloudflare TURNが未設定/取得失敗のときに最低限クライアントへ渡すSTUNサーバー一覧。
 /// これが無いと NAT 越しのクライアントは host候補(私有IP)しか集められず、ICEが
@@ -552,6 +556,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map(|s| s.trim().to_string())
             .collect(),
     };
+
+    // 定期スイープ: 60秒ごとに、全員のreliableチャンネルが無応答になったルームを破棄する。
+    // disconnect_player の PeerConnection state 遷移トリガーを取りこぼした場合の保険。
+    {
+        let game = Arc::clone(&state.game);
+        tokio::spawn(async move {
+            let mut ticker =
+                tokio::time::interval(std::time::Duration::from_secs(ROOM_SWEEP_INTERVAL_SECS));
+            loop {
+                ticker.tick().await;
+                let closed = game.write().await.sweep_unresponsive_rooms();
+                for (player_id, reliable, unreliable) in closed {
+                    warn!(
+                        "Swept unresponsive room member [{player_id}] (no response within {ROOM_SWEEP_INTERVAL_SECS}s sweep interval)"
+                    );
+                    spawn_close_channels(player_id, reliable, unreliable);
+                }
+            }
+        });
+    }
 
     let app = Router::new()
         .route("/", get(hello))
