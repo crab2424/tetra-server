@@ -1,6 +1,7 @@
 /target
 /logs
 /key
+/token
 **/.*
 !/.github/
 !/.github/**
