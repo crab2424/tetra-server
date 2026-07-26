@@ -11,6 +11,7 @@ pub async fn handle_unreliable_connection(
     dc: Arc<webrtc::data_channel::RTCDataChannel>,
     game: Arc<RwLock<Game>>,
     id: uuid::Uuid,
+    pc_weak: std::sync::Weak<webrtc::peer_connection::RTCPeerConnection>,
 ) -> () {
     // ★ Weak で保持（reliable 側と同じくサイクル＝FDリーク防止）
     let dc_weak = Arc::downgrade(&dc);
@@ -111,8 +112,9 @@ pub async fn handle_unreliable_connection(
 
     dc.on_close(Box::new(move || {
         let game = Arc::clone(&game);
+        let pc_weak = pc_weak.clone();
         Box::pin(async move {
-            disconnect_player(game, id, None).await;
+            disconnect_player(game, id, Some(pc_weak)).await;
         })
     }));
 }

@@ -25,7 +25,6 @@ use tracing_subscriber::prelude::*;
 use webrtc::api::APIBuilder;
 use webrtc::api::media_engine::MediaEngine;
 use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
-use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
@@ -197,10 +196,13 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
     let game_for_dc = Arc::clone(&state.game);
     let player_id_for_dc = Arc::clone(&player_id_shared);
+    // on_close ハンドラへ渡して確実に pc.close() を呼べるようにする（Weak なのでサイクルにならない）。
+    let pc_weak_for_dc = Arc::downgrade(&peer_connection);
     peer_connection.on_data_channel(Box::new(
         move |dc: Arc<webrtc::data_channel::RTCDataChannel>| {
             let game = Arc::clone(&game_for_dc);
             let player_id_for_dc = Arc::clone(&player_id_for_dc);
+            let pc_weak = pc_weak_for_dc.clone();
             let dc_label = dc.label().to_string();
 
             info!("Data channel created: {dc_label}");
@@ -210,16 +212,22 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     nest!(game);
                     // チャネルが開くのは offer 処理後なので、ここでは確定済みの player_id を読む。
                     let pid = *player_id_for_dc.lock().await;
-                    let _ = tokio::spawn(handle_reliable_connection(dc, game, pid)).instrument(
-                        info_span!("handle_connection", dc_label = %dc_label, player_id = %pid),
-                    );
+                    let _ = tokio::spawn(handle_reliable_connection(dc, game, pid, pc_weak))
+                        .instrument(info_span!(
+                            "handle_connection",
+                            dc_label = %dc_label,
+                            player_id = %pid
+                        ));
                 }),
                 connection::UNRELIABLE_CHANNEL_LABEL => Box::pin(async move {
                     nest!(game);
                     let pid = *player_id_for_dc.lock().await;
-                    let _ = tokio::spawn(handle_unreliable_connection(dc, game, pid)).instrument(
-                        info_span!("handle_connection", dc_label = %dc_label, player_id = %pid),
-                    );
+                    let _ = tokio::spawn(handle_unreliable_connection(dc, game, pid, pc_weak))
+                        .instrument(info_span!(
+                            "handle_connection",
+                            dc_label = %dc_label,
+                            player_id = %pid
+                        ));
                 }),
                 _ => {
                     debug!("Unknown data channel label: {dc_label}");
@@ -534,13 +542,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .with_setting_engine(s)
             .build(),
     );
-    let config = RTCConfiguration {
-        ice_servers: vec![RTCIceServer {
-            urls: DEFAULT_STUN_URLS.iter().map(|s| s.to_string()).collect(),
-            ..Default::default()
-        }],
-        ..Default::default()
-    };
+    // サーバー自身の PeerConnection には STUN を渡さない。NAT_1TO1_IP で host候補が
+    // 既にパブリックIPへ書き換わっており、STUNで求まる srflx候補は同じIPの重複でしかない。
+    // それでも ICE_UDP_PORT_RANGE の限られたポートを srflxサーバー数(=6)だけ余分に消費し、
+    // 1接続あたりの消費ポート数を7倍にしてポート枯渇を早めていた
+    // (2026-07-26に発生した障害の原因の一つ)。クライアントへ配る rtc_peer_ice_config の
+    // STUN/TURN(DEFAULT_STUN_URLS / default_stun_ice_config_json)とは別物なので、
+    // クライアント側の到達性には影響しない。
+    let config = RTCConfiguration::default();
 
     // Game は読み取り(中継時の RTCDataChannel 取得)が高頻度・書き込み(ルーム操作)が低頻度
     // なので RwLock を使い、中継の読み取りロックを全ルーム並行に取れるようにする(Issue #8)。
