@@ -131,7 +131,7 @@ pub async fn disconnect_player(
     id: uuid::Uuid,
     pc_weak: Option<std::sync::Weak<webrtc::peer_connection::RTCPeerConnection>>,
 ) {
-    {
+    let room_id = {
         let game = game.write().await;
         if let Some(state) = game.get_connection_state(&id) {
             let mut state = match state.lock() {
@@ -153,6 +153,24 @@ pub async fn disconnect_player(
         } else {
             return;
         }
+        game.room_of(&id)
+    };
+
+    // 即時通知: 猶予に入ったことをルーム全員へ知らせる（「無表示の待ち時間」を無くすため）。
+    // クライアントはこれを受けて相手スロットに切断UI＋残り秒数カウントダウンを出す。
+    if let Some(rid) = room_id {
+        broadcast_json(
+            &game,
+            rid,
+            &payload::JsonMessage::JSONPlayerConnectionLostNotification(
+                payload::JSONPlayerConnectionLostNotification {
+                    room_id: rid,
+                    player_id: id,
+                    grace_ms: RECONNECT_GRACE_SECS * 1000,
+                },
+            ),
+        )
+        .await;
     }
 
     // 実切断確定 → PeerConnection を閉じて FD を解放（ICE ソケット等）

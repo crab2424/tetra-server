@@ -270,16 +270,39 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         };
                         if exists {
                             *player_id_for_loop.lock().await = rid;
-                            let g = game_for_loop.read().await;
-                            if let Some(conn_state) = g.get_connection_state(&rid) {
-                                let s = conn_state.lock();
-                                if let Ok(mut s) = s {
-                                    if matches!(*s, crate::game::ConnectionState::Disconnected) {
-                                        *s = crate::game::ConnectionState::Establishing;
+                            let mut was_disconnected = false;
+                            let room_id = {
+                                let g = game_for_loop.read().await;
+                                if let Some(conn_state) = g.get_connection_state(&rid) {
+                                    let s = conn_state.lock();
+                                    if let Ok(mut s) = s {
+                                        if matches!(*s, crate::game::ConnectionState::Disconnected)
+                                        {
+                                            *s = crate::game::ConnectionState::Establishing;
+                                            was_disconnected = true;
+                                        }
                                     }
                                 }
-                            }
+                                g.room_of(&rid)
+                            };
                             info!("Reconnect offer: rebinding new PC to existing player [{rid}]");
+                            // 猶予中の切断UIを解除させるため、Reconnected をルームへ即通知する
+                            // （PlayerConnectionLostNotification とペアの通知）。
+                            if was_disconnected {
+                                if let Some(room_id) = room_id {
+                                    connection::broadcast_json(
+                                        &game_for_loop,
+                                        room_id,
+                                        &payload::JsonMessage::JSONPlayerReconnectedNotification(
+                                            payload::JSONPlayerReconnectedNotification {
+                                                room_id,
+                                                player_id: rid,
+                                            },
+                                        ),
+                                    )
+                                    .await;
+                                }
+                            }
                         } else {
                             warn!(
                                 "Reconnect offer for unknown player [{rid}]; treating as new connection."

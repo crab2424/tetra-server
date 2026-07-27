@@ -130,6 +130,8 @@ json_message!(
         PostMatchActionRequest, (id, Uuid), (room_id, Uuid), (action, u8);
         PostMatchActionNotification, (player_id, Uuid), (room_id, Uuid), (action, u8);
         PlayerDisconnectedNotification, (room_id, Uuid), (player_id, Uuid);
+        PlayerConnectionLostNotification, (room_id, Uuid), (player_id, Uuid), (grace_ms, u64);
+        PlayerReconnectedNotification, (room_id, Uuid), (player_id, Uuid);
     }
 );
 

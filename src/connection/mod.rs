@@ -3,7 +3,8 @@ mod reliable;
 mod unreliable;
 
 pub use common::{
-    RELIABLE_CHANNEL_LABEL, UNRELIABLE_CHANNEL_LABEL, disconnect_player, spawn_close_channels,
+    RELIABLE_CHANNEL_LABEL, UNRELIABLE_CHANNEL_LABEL, broadcast_json, disconnect_player,
+    spawn_close_channels,
 };
 pub use reliable::handle_reliable_connection;
 pub use unreliable::handle_unreliable_connection;
