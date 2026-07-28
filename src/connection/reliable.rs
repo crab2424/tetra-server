@@ -598,14 +598,14 @@ pub async fn handle_reliable_connection(
                                     message: result.clone().err()
                                 });
 
-                                if result.is_ok() {
+                                if let Ok(sanitized_setting) = result {
                                     broadcast_json(
                                         &game,
                                         room_id,
                                         &payload::JsonMessage::JSONUpdateMatchSettingNotification(
                                             payload::JSONUpdateMatchSettingNotification {
                                                 room_id,
-                                                setting,
+                                                setting: sanitized_setting,
                                             },
                                         ),
                                     )

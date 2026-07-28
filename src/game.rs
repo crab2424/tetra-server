@@ -1,7 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 use webrtc::data_channel::RTCDataChannel;
 use webrtc::data_channel::data_channel_state::RTCDataChannelState;
@@ -55,54 +55,62 @@ pub fn validate_garbage_payload(body: &[u8], receiver_rule: &str) -> Result<(), 
 
 /// オンライン対戦で CPU 対戦設定から独立して使う標準ルール。
 /// ランダムマッチと通常のルームマッチの初期値をサーバー側で統一する。
-pub const ONLINE_DEFAULT_MATCH_SETTING: &str = r#"{"holdEnabled":true,"b2bBonus":true,"garbageMultiplier":1.0,"marginTime":96,"garbageHoleRate":70,"garbageDamageOnClear":true,"ojamaRate":70}"#;
+pub const ONLINE_DEFAULT_MATCH_SETTING: &str = r#"{"setTarget":1,"holdEnabled":true,"b2bBonus":true,"garbageMultiplier":1.0,"marginTime":96,"garbageHoleRate":70,"garbageDamageOnClear":true,"ojamaRate":70}"#;
 
-fn validate_match_setting(setting: &str) -> Result<(), String> {
+/// 既知キーのみを検証・再シリアライズして返す。未知キーはクライアントの先行
+/// リリース（新設定の追加）で既存設定が丸ごと拒否されないよう、エラーにせず
+/// 警告ログを出して黙って捨てる（[[project-tetra-server]] 「フレーム拡張は
+/// サーバー無改造で可能」と同じ前方互換方針）。既知キーの値異常は従来通りエラー。
+fn sanitize_match_setting(setting: &str) -> Result<String, String> {
     let value: serde_json::Value = serde_json::from_str(setting)
         .map_err(|_| "Match setting must be valid JSON".to_string())?;
     let object = value
         .as_object()
         .ok_or_else(|| "Match setting must be a JSON object".to_string())?;
 
-    for key in object.keys() {
-        if !matches!(
-            key.as_str(),
-            "holdEnabled"
-                | "b2bBonus"
-                | "garbageMultiplier"
-                | "marginTime"
-                | "garbageHoleRate"
-                | "garbageDamageOnClear"
-                | "ojamaRate"
-        ) {
-            return Err(format!("Unknown match setting: {key}"));
-        }
-    }
+    let mut sanitized = serde_json::Map::new();
 
-    for key in ["holdEnabled", "b2bBonus", "garbageDamageOnClear"] {
-        if let Some(value) = object.get(key) {
-            if !value.is_boolean() {
-                return Err(format!("{key} must be a boolean"));
+    for (key, value) in object {
+        match key.as_str() {
+            "holdEnabled" | "b2bBonus" | "garbageDamageOnClear" => {
+                if !value.is_boolean() {
+                    return Err(format!("{key} must be a boolean"));
+                }
+                sanitized.insert(key.clone(), value.clone());
+            }
+            "setTarget" => {
+                let number = value
+                    .as_f64()
+                    .ok_or_else(|| format!("{key} must be a number"))?;
+                if number.fract() != 0.0 || number < 1.0 || number > 9.0 {
+                    return Err(format!("{key} must be an integer between 1 and 9"));
+                }
+                sanitized.insert(key.clone(), value.clone());
+            }
+            "garbageMultiplier" | "marginTime" | "garbageHoleRate" | "ojamaRate" => {
+                let (min, max) = match key.as_str() {
+                    "garbageMultiplier" => (0.0, 3.0),
+                    "marginTime" => (0.0, 300.0),
+                    "garbageHoleRate" => (0.0, 100.0),
+                    "ojamaRate" => (0.0, 200.0),
+                    _ => unreachable!(),
+                };
+                let number = value
+                    .as_f64()
+                    .ok_or_else(|| format!("{key} must be a number"))?;
+                if !number.is_finite() || number < min || number > max {
+                    return Err(format!("{key} must be between {min} and {max}"));
+                }
+                sanitized.insert(key.clone(), value.clone());
+            }
+            unknown => {
+                warn!("Ignoring unknown match setting key: {unknown}");
             }
         }
     }
 
-    for (key, min, max) in [
-        ("garbageMultiplier", 0.0, 3.0),
-        ("marginTime", 0.0, 300.0),
-        ("garbageHoleRate", 0.0, 100.0),
-        ("ojamaRate", 0.0, 200.0),
-    ] {
-        if let Some(value) = object.get(key) {
-            let number = value
-                .as_f64()
-                .ok_or_else(|| format!("{key} must be a number"))?;
-            if !number.is_finite() || number < min || number > max {
-                return Err(format!("{key} must be between {min} and {max}"));
-            }
-        }
-    }
-    Ok(())
+    serde_json::to_string(&sanitized)
+        .map_err(|e| format!("Failed to serialize match setting: {e}"))
 }
 
 /// ランダムマッチの結果。待機列に入ったか、相手とマッチしてルームができたか。
@@ -342,13 +350,15 @@ impl Game {
     }
 
     /// 部屋主が対戦前にルール設定を更新する。設定変更は READY を無効化する。
+    /// 戻り値は保存後（サニタイズ済み）の設定文字列。呼び出し側の通知配信は
+    /// クライアントが送った生の文字列ではなくこの値を使うこと。
     pub fn update_match_setting(
         &mut self,
         player_id: &Uuid,
         room_id: Uuid,
         setting: String,
-    ) -> Result<(), String> {
-        validate_match_setting(&setting)?;
+    ) -> Result<String, String> {
+        let sanitized = sanitize_match_setting(&setting)?;
         let room = self
             .rooms
             .get_mut(&room_id)
@@ -359,9 +369,9 @@ impl Game {
         if room.status != RoomStatus::Waiting {
             return Err("Cannot change match settings after the match has started".to_string());
         }
-        room.match_setting = setting;
+        room.match_setting = sanitized.clone();
         room.ready_players.clear();
-        Ok(())
+        Ok(sanitized)
     }
 
     /// プレイヤー自身の表示名を更新する。
@@ -1053,13 +1063,16 @@ mod tests {
             .expect("guest joins");
         game.rooms.get_mut(&room_id).unwrap().ready_players = vec![owner, guest];
 
-        let setting = r#"{"holdEnabled":false,"b2bBonus":true,"garbageMultiplier":1.5,"marginTime":96,"garbageHoleRate":70,"garbageDamageOnClear":true,"ojamaRate":70}"#;
-        assert!(
-            game.update_match_setting(&owner, room_id, setting.to_string())
-                .is_ok()
-        );
+        // クライアントが実際に送るJSON（ms-gridの全キーを {...ms, ...patch} でスプレッド）を模す。
+        let setting = r#"{"setTarget":3,"holdEnabled":false,"b2bBonus":true,"garbageMultiplier":1.5,"marginTime":96,"garbageHoleRate":70,"garbageDamageOnClear":true,"ojamaRate":70}"#;
+        let saved = game
+            .update_match_setting(&owner, room_id, setting.to_string())
+            .expect("full client-sent setting must be accepted");
         let room = game.rooms.get(&room_id).unwrap();
-        assert_eq!(room.match_setting, setting);
+        assert_eq!(room.match_setting, saved);
+        let saved_value: serde_json::Value = serde_json::from_str(&saved).unwrap();
+        let expected_value: serde_json::Value = serde_json::from_str(setting).unwrap();
+        assert_eq!(saved_value, expected_value);
         assert!(room.ready_players.is_empty());
 
         assert!(
@@ -1070,5 +1083,38 @@ mod tests {
             game.update_match_setting(&owner, room_id, r#"{"garbageMultiplier":99}"#.to_string(),)
                 .is_err()
         );
+        assert!(
+            game.update_match_setting(&owner, room_id, r#"{"setTarget":0}"#.to_string())
+                .is_err(),
+            "setTarget out of 1..=9 range must be rejected"
+        );
+    }
+
+    #[test]
+    fn match_setting_unknown_keys_are_dropped_not_rejected() {
+        let mut game = Game::default();
+        let owner = Uuid::new_v4();
+        let (room_id, _code) = game.new_room(
+            owner,
+            "settings".to_string(),
+            2,
+            false,
+            vec![],
+            "owner".to_string(),
+            "tet".to_string(),
+        );
+
+        // 未知キーが混ざっていても既知キーだけ保存され、エラーにはならない
+        // （クライアント先行リリースで既存設定が丸ごと拒否されるのを防ぐ方針）。
+        let saved = game
+            .update_match_setting(
+                &owner,
+                room_id,
+                r#"{"setTarget":2,"someFutureKey":true}"#.to_string(),
+            )
+            .expect("unknown keys must be sanitized, not rejected");
+        let saved_value: serde_json::Value = serde_json::from_str(&saved).unwrap();
+        assert_eq!(saved_value.get("setTarget").unwrap(), 2);
+        assert!(saved_value.get("someFutureKey").is_none());
     }
 }
