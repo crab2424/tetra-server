@@ -191,8 +191,16 @@ pub async fn handle_reliable_connection(
                                         tags: raw_room.tags.iter().map(|tag| *tag as u32).collect(),
                                     })
                                     .collect();
+                                let (online_count, in_match_count, matching_count) =
+                                    game.online_stats();
 
-                                jsend!(dc_clone, JSONGetRoomsResponse { id: req_id, rooms });
+                                jsend!(dc_clone, JSONGetRoomsResponse {
+                                    id: req_id,
+                                    rooms,
+                                    online_count,
+                                    in_match_count,
+                                    matching_count
+                                });
                             }
 
                             payload::JsonMessage::JSONCreateRoomRequest(req) => {

@@ -258,6 +258,28 @@ impl Game {
             .unwrap_or(false)
     }
 
+    /// ロビーの人数バッジ表示用の集計値。
+    /// (現在接続中の人数, 対戦中の人数, ランダムマッチ待機中の人数) の集計値のみを返す。
+    /// ユーザー名・ルームの組み合わせ等の個人が追える情報は一切含まない。
+    pub fn online_stats(&self) -> (u32, u32, u32) {
+        // connections には DataChannel が1本入った時点でエントリが出来るため、
+        // len() をそのまま使うと接続確立途中のものを過大カウントする。
+        // is_player_responsive と同じ基準（reliable が Open）で数える。
+        let online_count = self
+            .connections
+            .keys()
+            .filter(|id| self.is_player_responsive(id))
+            .count() as u32;
+        let in_match_count = self
+            .rooms
+            .values()
+            .filter(|room| room.status == RoomStatus::Playing)
+            .map(|room| room.players.len() as u32)
+            .sum();
+        let matching_count = self.matchmaking_queue.len() as u32;
+        (online_count, in_match_count, matching_count)
+    }
+
     /// 定期スイープ用: 全員のreliableチャンネルが無応答（Open でない）になっているルームを
     /// まとめて破棄する。PeerConnection の Failed/Closed 遷移を取りこぼして
     /// disconnect_player が起動しないケースの保険（メモリに残り続けるゾンビ部屋対策）。

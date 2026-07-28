@@ -87,7 +87,7 @@ json_message!(
         Ping, (id, Uuid);
         Pong, (id, Uuid);
         GetRoomsRequest, (id, Uuid);
-        GetRoomsResponse, (id, Uuid), (rooms, Vec<ListRoomInfo>);
+        GetRoomsResponse, (id, Uuid), (rooms, Vec<ListRoomInfo>), (online_count, u32), (in_match_count, u32), (matching_count, u32);
         CreateRoomRequest, (id, Uuid), (room_name, String), (max_players, u8), (is_public, bool), (tags, Vec<u32>), (username, String), (rule, String);
         CreateRoomResponse, (id, Uuid), (room_id, Uuid), (code, String);
         JoinRoomRequest, (id, Uuid), (room_id, Uuid), (username, String), (rule, String);
