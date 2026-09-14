@@ -47,6 +47,46 @@ macro_rules! nest {
 /// 取りこぼしてゾンビ部屋がメモリに残り続ける問題への保険（game::Game::sweep_unresponsive_rooms）。
 const ROOM_SWEEP_INTERVAL_SECS: u64 = 60;
 
+/// 通信プロトコル番号（設計: source_assets/memory/v2.2.1/tetlabo-protocol-version-design.md）。
+/// アプリのバージョン(ALLOW_VERSIONS)とは別に、接続を許可するかどうかを決める値。
+/// 次のいずれかを変えたときだけ +1 し、クライアント側の同名定数
+/// (src/online/protocol_version.ts の PROTOCOL_VERSION)も同時に上げる:
+///   1. シグナリング(WebSocketのJSON)の形式
+///   2. ゲームフレーム(DataChannelのバイナリ)のopcode追加・形式変更・受理条件
+///   3. 相手に影響する対戦ルール(おじゃまの計算・相殺など)
+/// それ以外の変更(見た目・PRACTICE・シングルの修正など)では上げない＝サーバー再デプロイ不要。
+const PROTOCOL_VERSION: u32 = 1;
+
+/// 認証判定を接続処理から切り出したもの（単体テスト用）。
+/// `protocol` が Some ならプロトコル番号の完全一致で判定する（新クライアント）。
+/// `protocol` が None の旧クライアント（2.2.0以前）は、移行期間として従来どおり
+/// ALLOW_VERSIONS(アプリのバージョン文字列)で判定する。
+/// 戻り値: Ok(())=許可 / Err(拒否メッセージ)。
+fn check_auth(version: &str, protocol: Option<u32>, allow_versions: &[String]) -> Result<(), String> {
+    match protocol {
+        Some(p) => {
+            if p == PROTOCOL_VERSION {
+                Ok(())
+            } else {
+                Err(format!(
+                    "Unsupported protocol version: {p}. Server protocol version: {PROTOCOL_VERSION}.\n\
+                     Please reload or reopen the client to update to a supported version."
+                ))
+            }
+        }
+        None => {
+            if allow_versions.iter().any(|v| v == version) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "Unsupported client version: {version}. Allowed versions: {allow_versions:?}\n\
+                     Please reload or reopen the client to update to a supported version."
+                ))
+            }
+        }
+    }
+}
+
 /// Cloudflare TURNが未設定/取得失敗のときに最低限クライアントへ渡すSTUNサーバー一覧。
 /// これが無いと NAT 越しのクライアントは host候補(私有IP)しか集められず、ICEが
 /// 到達可能な候補ペアを1つも作れず無言のまま固まる(2026-07-23に発生した障害の原因)。
@@ -372,18 +412,18 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         warn!("Failed to add ICE candidate: {e}");
                     }
                 }
-                signaling::SignalMessage::Auth { version } => {
-                    if !state.allow_versions.contains(&version) {
-                        error!("Rejected connection with unsupported client version: {version}");
+                signaling::SignalMessage::Auth { version, protocol } => {
+                    if let Err(message) = check_auth(&version, protocol, &state.allow_versions) {
+                        error!(
+                            "Rejected connection with unsupported client (version={version}, protocol={protocol:?}): {message}"
+                        );
 
                         let _ = ws_sender.lock().await.send(Message::Text(
                             serde_json::to_string(&signaling::SignalMessage::AuthResult {
                                 success: false,
-                                message: Some(format!(
-                                    "Unsupported client version: {version}. Allowed versions: {:?}\nPlease reload or reopen the client to update to a supported version.",
-                                    state.allow_versions
-                                )),
+                                message: Some(message),
                                 rtc_peer_ice_config: None,
+                                protocol: Some(PROTOCOL_VERSION),
                             })
                             .unwrap()
                             .into(),
@@ -391,7 +431,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
                         break;
                     } else {
-                        info!("Client authenticated with version: {version}");
+                        info!("Client authenticated with version: {version}, protocol: {protocol:?}");
 
                         let ice_config: Option<String> = {
                             // 空文字列は「未設定」として扱う。env::var は空文字でも Ok("") を返すため、
@@ -460,6 +500,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     success: true,
                                     message: None,
                                     rtc_peer_ice_config: ice_config,
+                                    protocol: Some(PROTOCOL_VERSION),
                                 })
                                 .unwrap()
                                 .into(),
@@ -619,4 +660,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     axum::serve(listener, app).await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn allow_versions() -> Vec<String> {
+        vec!["2.1.0".to_string(), "2.1.1".to_string(), "2.2.0".to_string()]
+    }
+
+    #[test]
+    fn protocol_match_is_allowed() {
+        assert!(check_auth("2.2.1", Some(PROTOCOL_VERSION), &allow_versions()).is_ok());
+    }
+
+    #[test]
+    fn protocol_mismatch_is_rejected_even_if_version_is_allowed() {
+        // versionがALLOW_VERSIONSに載っていても、protocolが一致しなければ拒否する
+        // （完全一致方式。範囲許可はしない）。
+        assert!(check_auth("2.1.1", Some(PROTOCOL_VERSION + 1), &allow_versions()).is_err());
+    }
+
+    #[test]
+    fn no_protocol_falls_back_to_allow_versions() {
+        // 旧クライアント（2.2.0以前）はprotocolを送らない＝移行期間はversion文字列で判定する。
+        assert!(check_auth("2.1.1", None, &allow_versions()).is_ok());
+        assert!(check_auth("1.3.0", None, &allow_versions()).is_err());
+    }
+
+    #[test]
+    fn no_protocol_and_empty_allow_versions_is_rejected() {
+        assert!(check_auth("2.2.0", None, &[]).is_err());
+    }
 }

@@ -24,10 +24,19 @@ pub enum SignalMessage {
     // クライアント認証
     Auth {
         version: String,
+        /// 通信プロトコル番号（設計: source_assets/memory/v2.2.1/tetlabo-protocol-version-design.md）。
+        /// 旧クライアント（2.2.0以前）はこのフィールドを送らない。Noneのときは移行期間として
+        /// 従来どおり ALLOW_VERSIONS(version文字列)で判定する（main.rs::check_auth 参照）。
+        #[serde(default)]
+        protocol: Option<u32>,
     },
     AuthResult {
         success: bool,
         message: Option<String>,
         rtc_peer_ice_config: Option<String>,
+        /// サーバー側のプロトコル番号。拒否時にクライアントが「サーバーの方が新しい/古い」を
+        /// 判断するために使う。新クライアントだけが解釈し、旧クライアントは無視する。
+        #[serde(default)]
+        protocol: Option<u32>,
     },
 }
