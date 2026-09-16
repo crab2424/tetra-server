@@ -513,6 +513,7 @@ pub async fn handle_reliable_connection(
                                             }
                                         };
                                         let owner_id = room.owner;
+                                        let accounts = game.room_accounts(&room_id);
                                         let notif = payload::JSONRoomInfoNotification {
                                             room_id,
                                             owner_id,
@@ -525,6 +526,7 @@ pub async fn handle_reliable_connection(
                                             pings: room.pings.iter().map(|(pid, ms)| (*pid, *ms)).collect(),
                                             code: room.code.clone(),
                                             is_public: room.is_public,
+                                            accounts,
                                         };
                                         jsend!(dc_clone, JSONRoomInfoNotification { ..notif });
                                     }

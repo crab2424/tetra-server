@@ -6,6 +6,7 @@ use uuid::Uuid;
 use webrtc::data_channel::RTCDataChannel;
 use webrtc::data_channel::data_channel_state::RTCDataChannelState;
 
+use crate::account::Account;
 use crate::room::{Room, RoomStatus};
 
 pub const GARBAGE_PROTOCOL_VERSION: u8 = 1;
@@ -157,6 +158,12 @@ pub struct Game {
     matchmaking_queue: VecDeque<(Uuid, String, String)>,
     /// Garbage の送信時刻。古い時刻を捨てながらプレイヤー単位でレート制限する。
     garbage_sent_at: HashMap<Uuid, VecDeque<Instant>>,
+    /// online アカウント化(設計 v2.2.2 §7.2): チケット検証済みの Discord プロフィール。
+    /// キーは Offer 処理で確定した player_id。ゲストは登録されない。
+    accounts: HashMap<Uuid, Account>,
+    /// 再接続の乗っ取り対策(設計 v2.2.2 §7.3): player_id ごとの現在有効なシークレット。
+    /// Offer の再接続要求はこれと一致した場合のみ再バインドを許可する。
+    reconnect_secrets: HashMap<Uuid, String>,
 }
 
 impl Default for Game {
@@ -168,6 +175,8 @@ impl Default for Game {
             room_codes: HashMap::new(),
             matchmaking_queue: VecDeque::new(),
             garbage_sent_at: HashMap::new(),
+            accounts: HashMap::new(),
+            reconnect_secrets: HashMap::new(),
         }
     }
 }
@@ -240,6 +249,9 @@ impl Game {
         self.matchmaking_queue
             .retain(|(pid, _, _)| pid != player_id);
         self.garbage_sent_at.remove(player_id);
+        // アカウント紐付け・再接続シークレットも掃除する（設計 v2.2.2 §7.2/§7.3）
+        self.accounts.remove(player_id);
+        self.reconnect_secrets.remove(player_id);
         // 経路表・所属ルームからも退去させる
         self.leave_room(player_id);
 
@@ -326,6 +338,13 @@ impl Game {
         username: String,
         rule: String,
     ) -> Result<(), String> {
+        // ★A(設計 v2.2.2 §7.2): アカウント持ちは表示名を Discord 表示名に固定し、
+        // クライアントの自由入力(username引数)は無視する。
+        let username = self
+            .accounts
+            .get(&player_id)
+            .map(|account| account.name.clone())
+            .unwrap_or(username);
         let room = self
             .rooms
             .get_mut(&room_id)
@@ -405,10 +424,17 @@ impl Game {
         player_id: &Uuid,
         username: String,
     ) -> Result<(), String> {
-        let username = username.trim().to_string();
-        if username.is_empty() || username.chars().count() > 16 {
-            return Err("Name must be 1-16 characters".to_string());
-        }
+        // ★A(設計 v2.2.2 §7.2): アカウント持ちは表示名を Discord 表示名に固定する。
+        // クライアントの自由入力は検証すらせず無視する(ゲストのみ従来の1-16文字チェックが働く)。
+        let username = if let Some(account) = self.accounts.get(player_id) {
+            account.name.clone()
+        } else {
+            let trimmed = username.trim().to_string();
+            if trimmed.is_empty() || trimmed.chars().count() > 16 {
+                return Err("Name must be 1-16 characters".to_string());
+            }
+            trimmed
+        };
         if let Some(room_id) = self.player_rooms.get(player_id).copied() {
             if let Some(room) = self.rooms.get_mut(&room_id) {
                 if let Some(entry) = room.players.iter_mut().find(|(pid, _, _)| pid == player_id) {
@@ -561,6 +587,43 @@ impl Game {
         self.connections
             .get(player_id)
             .map(|pair| Arc::clone(&pair.state))
+    }
+
+    /// Offer 処理で player_id が確定した時点で呼ぶ（設計 v2.2.2 §7.2）。
+    pub fn set_account(&mut self, player_id: Uuid, account: Account) {
+        self.accounts.insert(player_id, account);
+    }
+
+    /// 再接続の乗っ取り対策(設計 v2.2.2 §7.3)用シークレットを設定/更新する。
+    pub fn set_reconnect_secret(&mut self, player_id: Uuid, secret: String) {
+        self.reconnect_secrets.insert(player_id, secret);
+    }
+
+    /// 現在有効な reconnect_secret を読む（消費しない）。
+    pub fn reconnect_secret_of(&self, player_id: &Uuid) -> Option<String> {
+        self.reconnect_secrets.get(player_id).cloned()
+    }
+
+    /// reconnect_secret を取り出して削除する。再接続の成立時、使い捨ての pid 側の
+    /// エントリを正式な pid 側へ移す(ローテーション)のに使う。
+    pub fn take_reconnect_secret(&mut self, player_id: &Uuid) -> Option<String> {
+        self.reconnect_secrets.remove(player_id)
+    }
+
+    /// ルーム内のアカウント持ちプレイヤーだけを (player_id, 表示名, avatarUrl) で返す。
+    /// RoomInfoNotification.accounts の元データ(設計 v2.2.2 §7.2)。
+    pub fn room_accounts(&self, room_id: &Uuid) -> Vec<(Uuid, String, String)> {
+        let Some(room) = self.rooms.get(room_id) else {
+            return vec![];
+        };
+        room.players
+            .iter()
+            .filter_map(|(pid, _, _)| {
+                self.accounts
+                    .get(pid)
+                    .map(|account| (*pid, account.name.clone(), account.avatar_url.clone()))
+            })
+            .collect()
     }
 
     /// ルームの全ピア（自分以外）の ID を返す。0x2N 中継で使う。

@@ -103,7 +103,7 @@ json_message!(
         UpdateRoomRequest, (id, Uuid), (room_id, Uuid), (room_name, String), (max_players, u8), (is_public, bool), (tags, Vec<u32>);
         UpdateRoomResponse, (id, Uuid), (success, bool), (message, Option<String>);
         RoomInfoNotificationRequest, (id, Uuid);
-        RoomInfoNotification, (room_id, Uuid), (owner_id, Uuid), (room_name, String), (players, Vec<(Uuid, String, String)>), (max_players, u8), (tags, Vec<u32>), (match_setting, String), (ready_players, Vec<Uuid>), (pings, Vec<(Uuid, u32)>), (code, String), (is_public, bool);
+        RoomInfoNotification, (room_id, Uuid), (owner_id, Uuid), (room_name, String), (players, Vec<(Uuid, String, String)>), (max_players, u8), (tags, Vec<u32>), (match_setting, String), (ready_players, Vec<Uuid>), (pings, Vec<(Uuid, u32)>), (code, String), (is_public, bool), (accounts, Vec<(Uuid, String, String)>);
         SetReadyRequest, (id, Uuid), (room_id, Uuid), (ready, bool);
         SetReadyResponse, (id, Uuid), (success, bool), (message, Option<String>);
         TimeSyncRequest, (id, Uuid);

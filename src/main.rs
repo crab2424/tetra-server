@@ -8,6 +8,7 @@ use axum::{
     response::IntoResponse,
     routing::get,
 };
+use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
 use reqwest::{
     Url,
@@ -29,6 +30,7 @@ use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 
+mod account;
 mod connection;
 mod game;
 mod payload;
@@ -55,7 +57,10 @@ const ROOM_SWEEP_INTERVAL_SECS: u64 = 60;
 ///   2. ゲームフレーム(DataChannelのバイナリ)のopcode追加・形式変更・受理条件
 ///   3. 相手に影響する対戦ルール(おじゃまの計算・相殺など)
 /// それ以外の変更(見た目・PRACTICE・シングルの修正など)では上げない＝サーバー再デプロイ不要。
-const PROTOCOL_VERSION: u32 = 1;
+///
+/// 直近の変更(1→2): online アカウント化(設計 v2.2.2 §7.4)。Auth/AuthResult/Offer と
+/// RoomInfoNotification のフィールドを追加したため。
+const PROTOCOL_VERSION: u32 = 2;
 
 /// 認証判定を接続処理から切り出したもの（単体テスト用）。
 /// `protocol` が Some ならプロトコル番号の完全一致で判定する（新クライアント）。
@@ -110,6 +115,26 @@ struct AppState {
     api: Arc<webrtc::api::API>,
     config: RTCConfiguration,
     allow_versions: Vec<String>,
+    /// online アカウント化(設計 v2.2.2 §7)。TICKET_PUBLIC_KEY が未設定/不正なら None
+    /// になり、その場合は誰が送っても常にチケット検証をスキップして全員ゲスト扱いにする
+    /// （移行時・鍵未発行時にオンライン対戦自体を止めないため）。
+    ticket_verifier: Option<Arc<Mutex<account::TicketVerifier>>>,
+}
+
+fn now_unix_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+/// 再接続の乗っ取り対策(設計 v2.2.2 §7.3)用のランダムシークレットを生成する。
+/// 新規の乱数生成器を増やさず、既存依存の uuid(v4, OS RNG由来)を2個繋いで32byteにする。
+fn generate_reconnect_secret() -> String {
+    let mut bytes = [0u8; 32];
+    bytes[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+    bytes[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 
 /// ファイルディスクリプタのソフト上限を引き上げる。
@@ -164,6 +189,11 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     // 初期は新規発番だが、再接続offer(player_id付き)を受けると既存プレイヤーのIDへ
     // 差し替える（再バインド）。各ハンドラは発火時に共有値を読むため、Mutex で包む。
     let player_id_shared = Arc::new(Mutex::new(uuid::Uuid::new_v4()));
+
+    // Auth のチケット検証に成功した場合の Discord プロフィール（設計 v2.2.2 §7.2）。
+    // Offer 処理で player_id が確定した時点で Game.accounts へ書き込む。
+    // 他のハンドラ(on_ice_candidate等)はこれを読まないので player_id_shared と違い clone は不要。
+    let account_shared: Arc<Mutex<Option<account::Account>>> = Arc::new(Mutex::new(None));
 
     let ws_sender_for_ice = Arc::clone(&ws_sender);
     let player_id_for_ice = Arc::clone(&player_id_shared);
@@ -294,22 +324,37 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 signaling::SignalMessage::Offer {
                     sdp,
                     player_id: reconnect_id,
+                    reconnect_secret: offered_secret,
                 } => {
                     if !version_authenticated {
                         warn!("Received offer before client authentication; ignoring.");
                         continue;
                     }
                     // ★ 再接続: クライアントが既存の player_id を載せてきて、その人がまだ
-                    //    サーバーに居る（猶予中など）なら、この新PCをそのIDへ再バインドする。
+                    //    サーバーに居る（猶予中など）かつ、直前の AuthResult で受け取った
+                    //    reconnect_secret が一致する場合だけこの新PCをそのIDへ再バインドする
+                    //    （設計 v2.2.2 §7.3: player_id を知っているだけで乗っ取れないように）。
                     //    state を Establishing に戻して disconnect_player の猶予removalを止める
                     //    （新しい両チャネルが揃えば check_if_ready が Connected に進める）。
                     if let Some(rid) = reconnect_id {
-                        let exists = {
+                        let secret_matches = {
                             let g = game_for_loop.read().await;
                             g.get_connection_state(&rid).is_some()
+                                && offered_secret.is_some()
+                                && g.reconnect_secret_of(&rid) == offered_secret
                         };
-                        if exists {
+                        if secret_matches {
+                            // 今のこの接続自身のAuthで発行された使い捨てのsecretを rid 側へ
+                            // 引き継ぎ、以後の再接続はこの新しいsecretで検証されるようにする
+                            // （ローテーション。使い捨て側のエントリは残さず掃除する）。
+                            let own_pid = *player_id_for_loop.lock().await;
                             *player_id_for_loop.lock().await = rid;
+                            {
+                                let mut g = game_for_loop.write().await;
+                                if let Some(fresh_secret) = g.take_reconnect_secret(&own_pid) {
+                                    g.set_reconnect_secret(rid, fresh_secret);
+                                }
+                            }
                             let mut was_disconnected = false;
                             let room_id = {
                                 let g = game_for_loop.read().await;
@@ -345,9 +390,16 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             }
                         } else {
                             warn!(
-                                "Reconnect offer for unknown player [{rid}]; treating as new connection."
+                                "Reconnect offer for unknown player or mismatched reconnect_secret [{rid}]; treating as new connection."
                             );
                         }
+                    }
+
+                    // player_id が確定した(新規、または上の再接続で確定)ので、チケット検証済みの
+                    // アカウントがあればここで初めて Game 側へ反映する（設計 v2.2.2 §7.2）。
+                    if let Some(account) = account_shared.lock().await.clone() {
+                        let final_pid = *player_id_for_loop.lock().await;
+                        game_for_loop.write().await.set_account(final_pid, account);
                     }
 
                     let offer = match RTCSessionDescription::offer(sdp) {
@@ -412,7 +464,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         warn!("Failed to add ICE candidate: {e}");
                     }
                 }
-                signaling::SignalMessage::Auth { version, protocol } => {
+                signaling::SignalMessage::Auth { version, protocol, ticket } => {
                     if let Err(message) = check_auth(&version, protocol, &state.allow_versions) {
                         error!(
                             "Rejected connection with unsupported client (version={version}, protocol={protocol:?}): {message}"
@@ -424,6 +476,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 message: Some(message),
                                 rtc_peer_ice_config: None,
                                 protocol: Some(PROTOCOL_VERSION),
+                                account: None,
+                                reconnect_secret: None,
+                                ticket_error: None,
                             })
                             .unwrap()
                             .into(),
@@ -432,6 +487,40 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         break;
                     } else {
                         info!("Client authenticated with version: {version}, protocol: {protocol:?}");
+
+                        // online アカウント化(設計 v2.2.2 §7.2): チケットがあれば検証する。
+                        // TICKET_PUBLIC_KEY未設定(=ticket_verifierがNone)ならそもそも検証せず、
+                        // チケットの有無を問わず常にゲスト扱い(エラーも出さない)。
+                        // 不正/期限切れでも接続自体は拒否せずゲストとして続行し、ticket_error だけ返す。
+                        let mut ticket_error: Option<String> = None;
+                        if let (Some(t), Some(verifier)) = (&ticket, &state.ticket_verifier) {
+                            match verifier.lock().await.verify(t, now_unix_secs()) {
+                                Ok(acc) => {
+                                    info!("Ticket verified for account [{}]", acc.discord_id);
+                                    *account_shared.lock().await = Some(acc);
+                                }
+                                Err(e) => {
+                                    warn!("Ticket verification failed: {e}");
+                                    ticket_error = Some(e.to_string());
+                                }
+                            }
+                        }
+                        let account_info = account_shared
+                            .lock()
+                            .await
+                            .as_ref()
+                            .map(signaling::AccountInfo::from);
+
+                        // 再接続の乗っ取り対策(設計 v2.2.2 §7.3): この接続自身の現在のplayer_id
+                        // (Offer未処理ならそのまま確定IDになる)へシークレットを発行して紐付ける。
+                        let reconnect_secret = generate_reconnect_secret();
+                        {
+                            let pid = *player_id_for_loop.lock().await;
+                            game_for_loop
+                                .write()
+                                .await
+                                .set_reconnect_secret(pid, reconnect_secret.clone());
+                        }
 
                         let ice_config: Option<String> = {
                             // 空文字列は「未設定」として扱う。env::var は空文字でも Ok("") を返すため、
@@ -501,6 +590,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     message: None,
                                     rtc_peer_ice_config: ice_config,
                                     protocol: Some(PROTOCOL_VERSION),
+                                    account: account_info,
+                                    reconnect_secret: Some(reconnect_secret),
+                                    ticket_error,
                                 })
                                 .unwrap()
                                 .into(),
@@ -619,6 +711,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // なので RwLock を使い、中継の読み取りロックを全ルーム並行に取れるようにする(Issue #8)。
     let game = Arc::new(RwLock::new(game::Game::default()));
 
+    // online アカウント化(設計 v2.2.2 §7)。TICKET_PUBLIC_KEY が無い/1件も有効な鍵として
+    // パースできない場合は None にし、Auth処理はチケット検証自体を行わず全員ゲスト扱いにする
+    // （鍵未発行のローカル開発や移行期間でオンライン対戦自体を止めないため）。
+    let ticket_verifier: Option<Arc<Mutex<account::TicketVerifier>>> = {
+        let raw_keys = env::var("TICKET_PUBLIC_KEY").unwrap_or_default();
+        let audience = env::var("TICKET_AUDIENCE").unwrap_or_default();
+        let keys = account::parse_public_keys(&raw_keys);
+        if keys.is_empty() {
+            info!(
+                "TICKET_PUBLIC_KEY not set (or contains no valid keys); online accounts disabled, all connections are guests"
+            );
+            None
+        } else {
+            info!(
+                "Ticket verification enabled: {} public key(s), audience={audience:?}",
+                keys.len()
+            );
+            Some(Arc::new(Mutex::new(account::TicketVerifier::new(
+                keys, audience,
+            ))))
+        }
+    };
+
     let state = AppState {
         game,
         api,
@@ -628,12 +743,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .split(',')
             .map(|s| s.trim().to_string())
             .collect(),
+        ticket_verifier,
     };
 
     // 定期スイープ: 60秒ごとに、全員のreliableチャンネルが無応答になったルームを破棄する。
     // disconnect_player の PeerConnection state 遷移トリガーを取りこぼした場合の保険。
+    // ついでにチケットのjti再利用防止表(account::TicketVerifier)の期限切れエントリも掃除する。
     {
         let game = Arc::clone(&state.game);
+        let ticket_verifier = state.ticket_verifier.clone();
         tokio::spawn(async move {
             let mut ticker =
                 tokio::time::interval(std::time::Duration::from_secs(ROOM_SWEEP_INTERVAL_SECS));
@@ -645,6 +763,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "Swept unresponsive room member [{player_id}] (no response within {ROOM_SWEEP_INTERVAL_SECS}s sweep interval)"
                     );
                     spawn_close_channels(player_id, reliable, unreliable);
+                }
+                if let Some(verifier) = &ticket_verifier {
+                    verifier.lock().await.sweep_expired(now_unix_secs());
                 }
             }
         });

@@ -86,6 +86,7 @@ pub async fn notify_room(game: &Arc<RwLock<Game>>, room_id: Uuid) {
             return;
         };
         let owner_id = room.owner;
+        let accounts = game.room_accounts(&room_id);
         let notif = payload::JSONRoomInfoNotification {
             room_id,
             owner_id,
@@ -98,6 +99,7 @@ pub async fn notify_room(game: &Arc<RwLock<Game>>, room_id: Uuid) {
             pings: room.pings.iter().map(|(pid, ms)| (*pid, *ms)).collect(),
             code: room.code.clone(),
             is_public: room.is_public,
+            accounts,
         };
         let body = payload::JsonMessage::JSONRoomInfoNotification(notif)
             .to_response_body()
