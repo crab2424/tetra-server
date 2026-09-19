@@ -62,19 +62,40 @@ const ROOM_SWEEP_INTERVAL_SECS: u64 = 60;
 /// RoomInfoNotification のフィールドを追加したため。
 const PROTOCOL_VERSION: u32 = 2;
 
+/// 接続を受理するプロトコル番号の一覧（互換ウィンドウ）。
+/// サーバーは常にクライアントより先に本番へデプロイされる（クライアントのリリースはPR経由で
+/// 後追いになる）ため、完全一致だけにするとサーバーを上げた瞬間に「公開中の旧クライアントが
+/// 全員繋がらなくなる」（2026-09-16に実際に発生: 本番2.2.1=protocol 1 が protocol 2 の
+/// サーバーに全拒否された）。
+/// そこで **現行の PROTOCOL_VERSION と、ワイヤ互換な1つ前** を受理する。
+/// 番号を上げるときの運用:
+///   1. 変更が「追加のみ(旧クライアントが無視すれば動く)」なら、ここに旧番号を残したまま上げる
+///   2. 旧クライアントが動かなくなる破壊的変更なら、ここから旧番号を削って締め出す
+///
+/// クライアントを新バージョンでリリースし終えたら、次回のプロトコル更新時に古い番号を落とす。
+const SUPPORTED_PROTOCOL_VERSIONS: &[u32] = &[1, 2];
+
+/// Offer の再接続で `reconnect_secret` の一致を必須にし始めたプロトコル番号。
+/// これ未満のクライアントはそもそも secret を送らない実装なので、必須にすると
+/// 試合中の切断からの復帰(player_id 再バインド)ができなくなる。互換ウィンドウで
+/// 受け入れている以上、旧クライアントに限り secret 無しの再バインドを許可する
+/// （＝protocol 1 時代と同じ挙動。乗っ取り耐性も当時と同じで、新クライアントには影響しない）。
+const RECONNECT_SECRET_REQUIRED_PROTOCOL: u32 = 2;
+
 /// 認証判定を接続処理から切り出したもの（単体テスト用）。
-/// `protocol` が Some ならプロトコル番号の完全一致で判定する（新クライアント）。
+/// `protocol` が Some なら SUPPORTED_PROTOCOL_VERSIONS に含まれるかで判定する（新クライアント）。
 /// `protocol` が None の旧クライアント（2.2.0以前）は、移行期間として従来どおり
 /// ALLOW_VERSIONS(アプリのバージョン文字列)で判定する。
 /// 戻り値: Ok(())=許可 / Err(拒否メッセージ)。
 fn check_auth(version: &str, protocol: Option<u32>, allow_versions: &[String]) -> Result<(), String> {
     match protocol {
         Some(p) => {
-            if p == PROTOCOL_VERSION {
+            if SUPPORTED_PROTOCOL_VERSIONS.contains(&p) {
                 Ok(())
             } else {
                 Err(format!(
-                    "Unsupported protocol version: {p}. Server protocol version: {PROTOCOL_VERSION}.\n\
+                    "Unsupported protocol version: {p}. Server protocol version: {PROTOCOL_VERSION} \
+                     (supported: {SUPPORTED_PROTOCOL_VERSIONS:?}).\n\
                      Please reload or reopen the client to update to a supported version."
                 ))
             }
@@ -308,6 +329,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     ));
 
     let mut version_authenticated = false;
+    // Auth で受理したクライアントのプロトコル番号（送ってこない旧クライアントは None）。
+    // 再接続時に reconnect_secret を必須にするかの判定に使う。
+    let mut authed_protocol: Option<u32> = None;
 
     while let Some(Ok(msg)) = ws_receiver.next().await {
         if let Message::Text(text) = msg {
@@ -337,13 +361,18 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     //    state を Establishing に戻して disconnect_player の猶予removalを止める
                     //    （新しい両チャネルが揃えば check_if_ready が Connected に進める）。
                     if let Some(rid) = reconnect_id {
-                        let secret_matches = {
+                        // 互換ウィンドウで受けている旧クライアント(protocol < 2 / protocol無し)は
+                        // secret を送らない実装なので、その場合だけ secret 無しの再バインドを許す。
+                        let legacy_client = authed_protocol
+                            .is_none_or(|p| p < RECONNECT_SECRET_REQUIRED_PROTOCOL);
+                        let rebind_allowed = {
                             let g = game_for_loop.read().await;
-                            g.get_connection_state(&rid).is_some()
-                                && offered_secret.is_some()
-                                && g.reconnect_secret_of(&rid) == offered_secret
+                            let exists = g.get_connection_state(&rid).is_some();
+                            let secret_matches = offered_secret.is_some()
+                                && g.reconnect_secret_of(&rid) == offered_secret;
+                            exists && (secret_matches || (legacy_client && offered_secret.is_none()))
                         };
-                        if secret_matches {
+                        if rebind_allowed {
                             // 今のこの接続自身のAuthで発行された使い捨てのsecretを rid 側へ
                             // 引き継ぎ、以後の再接続はこの新しいsecretで検証されるようにする
                             // （ローテーション。使い捨て側のエントリは残さず掃除する）。
@@ -487,6 +516,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         break;
                     } else {
                         info!("Client authenticated with version: {version}, protocol: {protocol:?}");
+                        authed_protocol = protocol;
 
                         // online アカウント化(設計 v2.2.2 §7.2): チケットがあれば検証する。
                         // TICKET_PUBLIC_KEY未設定(=ticket_verifierがNone)ならそもそも検証せず、
@@ -798,9 +828,26 @@ mod tests {
 
     #[test]
     fn protocol_mismatch_is_rejected_even_if_version_is_allowed() {
-        // versionがALLOW_VERSIONSに載っていても、protocolが一致しなければ拒否する
-        // （完全一致方式。範囲許可はしない）。
+        // versionがALLOW_VERSIONSに載っていても、SUPPORTED_PROTOCOL_VERSIONS に
+        // 含まれないprotocolなら拒否する。
         assert!(check_auth("2.1.1", Some(PROTOCOL_VERSION + 1), &allow_versions()).is_err());
+        assert!(check_auth("2.1.1", Some(0), &allow_versions()).is_err());
+    }
+
+    #[test]
+    fn supported_protocol_versions_contain_current() {
+        // 現行の PROTOCOL_VERSION を互換ウィンドウに入れ忘れると全クライアントが弾かれる。
+        assert!(SUPPORTED_PROTOCOL_VERSIONS.contains(&PROTOCOL_VERSION));
+    }
+
+    #[test]
+    fn previous_protocol_version_is_allowed() {
+        // 互換ウィンドウ: 公開済みの旧クライアント(2.2.1 = protocol 1)も受理する。
+        // ALLOW_VERSIONS に載っていないバージョン文字列でも protocol で通ること。
+        assert!(check_auth("2.2.1", Some(1), &allow_versions()).is_ok());
+        for p in SUPPORTED_PROTOCOL_VERSIONS {
+            assert!(check_auth("2.2.1", Some(*p), &[]).is_ok());
+        }
     }
 
     #[test]
