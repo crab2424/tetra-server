@@ -39,3 +39,5 @@ $ cargo run
 | `ALLOW_VERSIONS`    | `protocol` を送らない旧クライアント（2.2.0以前）向けの許可バージョン一覧をカンマ区切りで指定します（上記参照） | `2.1.0,2.1.1`    |
 | `CF_TURN_TOKEN_ID`  | Cloudflare TURN のトークンIDを指定します (指定されない場合は，TURNは利用されません．) | `xxxx`           |
 | `CF_TURN_API_TOKEN` | Cloudflare TURN の APIトークンを指定します                                            | `xxxx`           |
+| `TICKET_PUBLIC_KEY` | online アカウント（Discord連携）のチケット署名検証に使う Ed25519 公開鍵（raw 32byte の base64．カンマ区切りで複数指定可＝鍵ローテーション用）．未設定・不正な場合はアカウント機能が無効になり，全接続がゲスト扱いになります | `xxxx`           |
+| `TICKET_AUDIENCE`   | チケットの `aud`（自ホスト名）と一致するか検証します．他サーバー向けに発行されたチケットの流用を防ぎます | `tetlabo-canary.duckdns.org` |
