@@ -47,4 +47,11 @@ pub struct Room {
     pub ready_players: Vec<Uuid>,
     /// 各プレイヤーの RTT (ms)。クライアントからの自己報告値。
     pub pings: HashMap<Uuid, u32>,
+    /// 決着した直後のリザルト表示中か。true の間は入室を断る（リザルト中に入った人がいると
+    /// 「全員が RETRY」にならず再戦が始まらないため）。次の start_match か、誰かが「ルームに戻る」を
+    /// 選んだとき・残りが 1 人以下になったときに false へ戻す。
+    pub post_match: bool,
+    /// 直前のマッチの結果（Some(Some(勝者)) / Some(None)=引き分け / None=結果なし）。
+    /// 切断中に決着した人が再接続したとき、WinnerNotification を送り直すために持つ。
+    pub last_result: Option<Option<Uuid>>,
 }

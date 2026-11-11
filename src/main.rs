@@ -210,6 +210,13 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     // 初期は新規発番だが、再接続offer(player_id付き)を受けると既存プレイヤーのIDへ
     // 差し替える（再バインド）。各ハンドラは発火時に共有値を読むため、Mutex で包む。
     let player_id_shared = Arc::new(Mutex::new(uuid::Uuid::new_v4()));
+    // この接続（PeerConnection）自体の識別子。Offer で player_id が決まったら Game に
+    // 「その人の今の接続」として記録し、切断処理は今の接続から来たときだけ動かす。
+    // （再接続で付け替えた後に古い接続の Failed/Closed が遅れて届いても、復帰済みの人を消さない）
+    let session_id = uuid::Uuid::new_v4();
+    // この接続が再接続での付け替え(rebind)か。reliable チャンネルが開いたら、切断中に起きた
+    // 対戦の状態（脱落・決着）を送り直す。
+    let rebound_shared = Arc::new(Mutex::new(false));
 
     // Auth のチケット検証に成功した場合の Discord プロフィール（設計 v2.2.2 §7.2）。
     // Offer 処理で player_id が確定した時点で Game.accounts へ書き込む。
@@ -273,7 +280,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 Box::pin(async move {
                     if trigger {
                         let pid = *player_id_for_state.lock().await;
-                        connection::disconnect_player(game, pid, Some(pc_weak)).await;
+                        connection::disconnect_player(game, pid, Some(pc_weak), Some(session_id))
+                            .await;
                     }
                 })
             },
@@ -287,12 +295,14 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
     let game_for_dc = Arc::clone(&state.game);
     let player_id_for_dc = Arc::clone(&player_id_shared);
+    let rebound_for_dc = Arc::clone(&rebound_shared);
     // on_close ハンドラへ渡して確実に pc.close() を呼べるようにする（Weak なのでサイクルにならない）。
     let pc_weak_for_dc = Arc::downgrade(&peer_connection);
     peer_connection.on_data_channel(Box::new(
         move |dc: Arc<webrtc::data_channel::RTCDataChannel>| {
             let game = Arc::clone(&game_for_dc);
             let player_id_for_dc = Arc::clone(&player_id_for_dc);
+            let rebound_for_dc = Arc::clone(&rebound_for_dc);
             let pc_weak = pc_weak_for_dc.clone();
             let dc_label = dc.label().to_string();
 
@@ -303,7 +313,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     nest!(game);
                     // チャネルが開くのは offer 処理後なので、ここでは確定済みの player_id を読む。
                     let pid = *player_id_for_dc.lock().await;
-                    let _ = tokio::spawn(handle_reliable_connection(dc, game, pid, pc_weak))
+                    let resync = *rebound_for_dc.lock().await;
+                    let _ = tokio::spawn(handle_reliable_connection(
+                        dc, game, pid, pc_weak, session_id, resync,
+                    ))
                         .instrument(info_span!(
                             "handle_connection",
                             dc_label = %dc_label,
@@ -313,7 +326,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 connection::UNRELIABLE_CHANNEL_LABEL => Box::pin(async move {
                     nest!(game);
                     let pid = *player_id_for_dc.lock().await;
-                    let _ = tokio::spawn(handle_unreliable_connection(dc, game, pid, pc_weak))
+                    let _ = tokio::spawn(handle_unreliable_connection(
+                        dc, game, pid, pc_weak, session_id,
+                    ))
                         .instrument(info_span!(
                             "handle_connection",
                             dc_label = %dc_label,
@@ -400,6 +415,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 g.room_of(&rid)
                             };
                             info!("Reconnect offer: rebinding new PC to existing player [{rid}]");
+                            *rebound_shared.lock().await = true;
                             // 猶予中の切断UIを解除させるため、Reconnected をルームへ即通知する
                             // （PlayerConnectionLostNotification とペアの通知）。
                             if was_disconnected {
@@ -429,6 +445,11 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     if let Some(account) = account_shared.lock().await.clone() {
                         let final_pid = *player_id_for_loop.lock().await;
                         game_for_loop.write().await.set_account(final_pid, account);
+                    }
+                    // この接続をプレイヤーの「今の接続」にする（再接続ならここで古い接続から切り替わる）
+                    {
+                        let final_pid = *player_id_for_loop.lock().await;
+                        game_for_loop.write().await.set_session(final_pid, session_id);
                     }
 
                     let offer = match RTCSessionDescription::offer(sdp) {

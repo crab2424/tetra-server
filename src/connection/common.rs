@@ -132,7 +132,23 @@ pub async fn disconnect_player(
     game: Arc<RwLock<Game>>,
     id: uuid::Uuid,
     pc_weak: Option<std::sync::Weak<webrtc::peer_connection::RTCPeerConnection>>,
+    session: Option<uuid::Uuid>,
 ) {
+    // 再接続で新しい接続へ付け替えた後に、古い接続の Failed/Closed が遅れて届いた場合は
+    // 何もしない（古い PeerConnection を閉じるだけ）。プレイヤー ID だけで動くと、復帰済みの人を
+    // Disconnected にして 8 秒後に除去し、新しいチャンネルまで閉じてしまっていた。
+    if let Some(session) = session {
+        let stale = !game.read().await.is_current_session(&id, &session);
+        if stale {
+            warn!("Ignoring disconnect of a stale connection for player [{id}] (already reconnected)");
+            if let Some(weak) = pc_weak {
+                if let Some(pc) = weak.upgrade() {
+                    let _ = pc.close().await;
+                }
+            }
+            return;
+        }
+    }
     let room_id = {
         let game = game.write().await;
         if let Some(state) = game.get_connection_state(&id) {
@@ -264,4 +280,85 @@ pub async fn disconnect_player(
             }
         }
     }
+}
+
+/// 対戦中の LeaveRoom / Close の後始末。負けとして記録した結果（`leave_room_recording_result`）を
+/// 残りの人へ配る（切断で除去したときと同じ流れ: PlayerDisconnected → 決着なら Winner）。
+pub async fn broadcast_leave_result(
+    game: &Arc<RwLock<Game>>,
+    player_id: Uuid,
+    result: Option<(Uuid, WinnerStatus)>,
+) {
+    let Some((rid, ws)) = result else { return };
+    broadcast_json(
+        game,
+        rid,
+        &payload::JsonMessage::JSONPlayerDisconnectedNotification(
+            payload::JSONPlayerDisconnectedNotification {
+                room_id: rid,
+                player_id,
+            },
+        ),
+    )
+    .await;
+    let winner = match ws {
+        WinnerStatus::Winner(w) => Some(w),
+        WinnerStatus::Draw => None,
+        WinnerStatus::MatchContinues => return,
+    };
+    broadcast_json(
+        game,
+        rid,
+        &payload::JsonMessage::JSONWinnerNotification(payload::JSONWinnerNotification {
+            room_id: rid,
+            winner,
+        }),
+    )
+    .await;
+}
+
+/// 再接続で付け替えた人へ、切断中に届かなかったかもしれない対戦の状態を送り直す。
+/// - 対戦中: 脱落済みの相手ごとに GameOver(0x26) フレームをその相手から届いた形で送る
+///   （クライアントは同じ人の 2 回目の GameOver を無視するので、届いていた場合も害はない）。
+/// - 決着済み（リザルト中）: WinnerNotification を送る（受け取り済みなら二重通知として捨てられる）。
+/// 新しい reliable チャンネルが開くのを少し待ってから送る。
+pub fn spawn_send_reattach_state(
+    game: Arc<RwLock<Game>>,
+    player_id: Uuid,
+    dc: Arc<webrtc::data_channel::RTCDataChannel>,
+) {
+    use webrtc::data_channel::data_channel_state::RTCDataChannelState;
+    tokio::spawn(async move {
+        for _ in 0..50 {
+            if dc.ready_state() == RTCDataChannelState::Open {
+                break;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+        if dc.ready_state() != RTCDataChannelState::Open {
+            return;
+        }
+        let Some((room_id, dead, result)) = game.read().await.reattach_state(&player_id) else {
+            return;
+        };
+        for dead_id in dead {
+            let raw = [payload::Opcode::MatchGameOverPayload as u8, 0];
+            let frame = relay_match_frame(&Bytes::copy_from_slice(&raw), &dead_id);
+            if let Err(e) = dc.send(&frame).await {
+                error!("Failed to resend GameOver to reconnected player {player_id}: {e}");
+            }
+        }
+        if let Some(winner) = result {
+            let msg = payload::JsonMessage::JSONWinnerNotification(payload::JSONWinnerNotification {
+                room_id,
+                winner,
+            });
+            if let Ok(body) = msg.to_response_body() {
+                let binary = payload::wrap_with_opcode(payload::Opcode::JSONResponsePayload, body);
+                if let Err(e) = dc.send(&Bytes::from(binary)).await {
+                    error!("Failed to resend WinnerNotification to reconnected player {player_id}: {e}");
+                }
+            }
+        }
+    });
 }
