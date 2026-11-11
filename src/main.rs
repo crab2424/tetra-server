@@ -58,9 +58,11 @@ const ROOM_SWEEP_INTERVAL_SECS: u64 = 60;
 ///   3. 相手に影響する対戦ルール(おじゃまの計算・相殺など)
 /// それ以外の変更(見た目・PRACTICE・シングルの修正など)では上げない＝サーバー再デプロイ不要。
 ///
-/// 直近の変更(1→2): online アカウント化(設計 v2.2.2 §7.4)。Auth/AuthResult/Offer と
+/// 直近の変更(2→3): テトのおじゃまの穴を受ける側が着弾時に決める規則に変更(対戦ルール)、
+/// あわせて Garbage フレームを v2(宛先ルール付き)に変更（クライアント v2.4.0）。
+/// (1→2): online アカウント化(設計 v2.2.2 §7.4)。Auth/AuthResult/Offer と
 /// RoomInfoNotification のフィールドを追加したため。
-const PROTOCOL_VERSION: u32 = 2;
+const PROTOCOL_VERSION: u32 = 3;
 
 /// 接続を受理するプロトコル番号の一覧（互換ウィンドウ）。
 /// サーバーは常にクライアントより先に本番へデプロイされる（クライアントのリリースはPR経由で
@@ -73,7 +75,11 @@ const PROTOCOL_VERSION: u32 = 2;
 ///   2. 旧クライアントが動かなくなる破壊的変更なら、ここから旧番号を削って締め出す
 ///
 /// クライアントを新バージョンでリリースし終えたら、次回のプロトコル更新時に古い番号を落とす。
-const SUPPORTED_PROTOCOL_VERSIONS: &[u32] = &[1, 2];
+///
+/// 3 は破壊的変更（穴の決め方が送る側→受ける側。部屋をプロトコル番号で分ける仕組みが無く、
+/// 旧規則のクライアントと同じ部屋で混ざるため）。1・2 は締め出し、クライアント v2.4.0 の
+/// 公開と同時にデプロイする（旧版はリロードで新版になる）。
+const SUPPORTED_PROTOCOL_VERSIONS: &[u32] = &[3];
 
 /// Offer の再接続で `reconnect_secret` の一致を必須にし始めたプロトコル番号。
 /// これ未満のクライアントはそもそも secret を送らない実装なので、必須にすると
@@ -862,13 +868,19 @@ mod tests {
     }
 
     #[test]
-    fn previous_protocol_version_is_allowed() {
-        // 互換ウィンドウ: 公開済みの旧クライアント(2.2.1 = protocol 1)も受理する。
-        // ALLOW_VERSIONS に載っていないバージョン文字列でも protocol で通ること。
-        assert!(check_auth("2.2.1", Some(1), &allow_versions()).is_ok());
+    fn supported_protocol_versions_are_allowed() {
+        // 互換ウィンドウに載っている番号は、ALLOW_VERSIONS に無いバージョン文字列でも protocol で通ること。
         for p in SUPPORTED_PROTOCOL_VERSIONS {
-            assert!(check_auth("2.2.1", Some(*p), &[]).is_ok());
+            assert!(check_auth("2.4.0", Some(*p), &[]).is_ok());
         }
+    }
+
+    #[test]
+    fn old_rule_protocol_versions_are_rejected() {
+        // protocol 3 は破壊的変更（おじゃまの穴を受ける側が決める・Garbage v2）。
+        // 旧規則のクライアント(protocol 1/2)は同じ部屋で混ざらないよう締め出す。
+        assert!(check_auth("2.2.1", Some(1), &allow_versions()).is_err());
+        assert!(check_auth("2.3.1", Some(2), &allow_versions()).is_err());
     }
 
     #[test]
