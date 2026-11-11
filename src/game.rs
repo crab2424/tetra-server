@@ -9,22 +9,45 @@ use webrtc::data_channel::data_channel_state::RTCDataChannelState;
 use crate::account::Account;
 use crate::room::{Room, RoomStatus};
 
-pub const GARBAGE_PROTOCOL_VERSION: u8 = 1;
+/// 宛先なしの旧形式（PROTOCOL 1/2 のクライアント）。生きている相手全員へ中継する。
+pub const GARBAGE_PROTOCOL_VERSION_LEGACY: u8 = 1;
+/// 宛先ルール付きの形式（PROTOCOL 3 のクライアント）:
+/// version(=2) + target:u8(1=tet / 2=puyo) + amount:u16(LE) + holes:u8[amount]。
+/// 混在 3 人以上の対戦では 1 回の攻撃で tet 向け（ライン数）・puyo 向け（おじゃま個数）の 2 本が
+/// 飛ぶので、target のルールの相手だけへ中継する（宛先が無いと受け手が違う単位で読んでしまう）。
+pub const GARBAGE_PROTOCOL_VERSION: u8 = 2;
 pub const MAX_GARBAGE_AMOUNT: usize = 1_000;
-pub const MAX_GARBAGE_FRAME_BYTES: usize = 1 + 1 + 2 + MAX_GARBAGE_AMOUNT;
+pub const MAX_GARBAGE_FRAME_BYTES: usize = 1 + 1 + 1 + 2 + MAX_GARBAGE_AMOUNT;
 pub const GARBAGE_RATE_LIMIT: usize = 60;
 pub const GARBAGE_RATE_WINDOW_SECS: u64 = 1;
 
+/// Garbage の宛先。None は旧形式（宛先なし）。
+pub fn garbage_target_rule(body: &[u8]) -> Result<Option<&'static str>, String> {
+    match body.first() {
+        Some(&GARBAGE_PROTOCOL_VERSION_LEGACY) => Ok(None),
+        Some(&GARBAGE_PROTOCOL_VERSION) => match body.get(1) {
+            Some(1) => Ok(Some("tet")),
+            Some(2) => Ok(Some("puyo")),
+            Some(t) => Err(format!("Invalid Garbage target: {t}")),
+            None => Err("Garbage payload is too short".to_string()),
+        },
+        Some(v) => Err(format!("Unsupported Garbage version: {v}")),
+        None => Err("Garbage payload is too short".to_string()),
+    }
+}
+
 /// Garbage 本体を検証し、受信側ルールに応じた穴/列の値を返す。
 pub fn validate_garbage_payload(body: &[u8], receiver_rule: &str) -> Result<(), String> {
-    if body.len() < 3 {
+    // 版ごとの「amount の位置」。旧形式は version の直後、新形式は version + target の後
+    let header = match garbage_target_rule(body)? {
+        None => 1,
+        Some(_) => 2,
+    };
+    if body.len() < header + 2 {
         return Err("Garbage payload is too short".to_string());
     }
-    if body[0] != GARBAGE_PROTOCOL_VERSION {
-        return Err(format!("Unsupported Garbage version: {}", body[0]));
-    }
 
-    let amount = u16::from_le_bytes([body[1], body[2]]) as usize;
+    let amount = u16::from_le_bytes([body[header], body[header + 1]]) as usize;
     if amount == 0 {
         return Err("Garbage amount must be greater than zero".to_string());
     }
@@ -33,11 +56,11 @@ pub fn validate_garbage_payload(body: &[u8], receiver_rule: &str) -> Result<(), 
             "Garbage amount exceeds maximum: {MAX_GARBAGE_AMOUNT}"
         ));
     }
-    let expected_len = 3 + amount;
+    let expected_len = header + 2 + amount;
     if body.len() != expected_len {
         return Err(format!(
             "Garbage amount does not match holes length: amount={amount}, holes={}",
-            body.len().saturating_sub(3)
+            body.len().saturating_sub(header + 2)
         ));
     }
 
@@ -46,7 +69,7 @@ pub fn validate_garbage_payload(body: &[u8], receiver_rule: &str) -> Result<(), 
         "puyo" => 5,
         _ => return Err("Invalid receiver rule".to_string()),
     };
-    if body[3..].iter().any(|hole| *hole > max_value) {
+    if body[header + 2..].iter().any(|hole| *hole > max_value) {
         return Err(format!(
             "Garbage hole/column must be between 0 and {max_value}"
         ));
@@ -164,6 +187,9 @@ pub struct Game {
     /// 再接続の乗っ取り対策(設計 v2.2.2 §7.3): player_id ごとの現在有効なシークレット。
     /// Offer の再接続要求はこれと一致した場合のみ再バインドを許可する。
     reconnect_secrets: HashMap<Uuid, String>,
+    /// player_id ごとの「今の接続」（PeerConnection 1 本 = WebSocket 1 本ごとの識別子）。
+    /// 再接続で付け替えた後に古い接続の切断が遅れて届いても、今の接続でなければ無視する。
+    sessions: HashMap<Uuid, Uuid>,
 }
 
 impl Default for Game {
@@ -177,6 +203,7 @@ impl Default for Game {
             garbage_sent_at: HashMap::new(),
             accounts: HashMap::new(),
             reconnect_secrets: HashMap::new(),
+            sessions: HashMap::new(),
         }
     }
 }
@@ -252,6 +279,7 @@ impl Game {
         // アカウント紐付け・再接続シークレットも掃除する（設計 v2.2.2 §7.2/§7.3）
         self.accounts.remove(player_id);
         self.reconnect_secrets.remove(player_id);
+        self.sessions.remove(player_id);
         // 経路表・所属ルームからも退去させる
         self.leave_room(player_id);
 
@@ -355,6 +383,9 @@ impl Game {
         if room.players.iter().any(|(pid, _, _)| *pid == player_id) {
             // すでに参加済み。冪等に成功扱い。
             return Ok(());
+        }
+        if room.post_match {
+            return Err("The previous match result is being shown. Please try again later".to_string());
         }
         if room.players.len() as u8 >= room.max_players {
             return Err("Room is full".to_string());
@@ -470,6 +501,10 @@ impl Game {
                     room.owner = *next_owner;
                 }
             }
+            if room.players.len() <= 1 {
+                // 再戦の相手がいなくなったので、リザルト中の入室制限を解く
+                room.post_match = false;
+            }
             if room.players.is_empty() {
                 empty_code = Some(room.code.clone());
             }
@@ -552,6 +587,74 @@ impl Game {
     /// 残ったメンバーへ通知するために使う（削除後は経路表から消えて引けなくなる）。
     pub fn room_of(&self, player_id: &Uuid) -> Option<Uuid> {
         self.player_rooms.get(player_id).copied()
+    }
+
+    /// 要求に書かれた room_id が、送ってきた人の所属ルームと一致するか。
+    /// 一致しない通知（他の部屋へのポーズ・投票など）は流さない。
+    pub fn is_in_room(&self, player_id: &Uuid, room_id: &Uuid) -> bool {
+        self.player_rooms.get(player_id) == Some(room_id)
+    }
+
+    /// この接続（session）をプレイヤーの「今の接続」として記録する。
+    pub fn set_session(&mut self, player_id: Uuid, session: Uuid) {
+        self.sessions.insert(player_id, session);
+    }
+
+    /// session がプレイヤーの今の接続か。記録が無ければ（古い経路・テスト）今の接続とみなす。
+    pub fn is_current_session(&self, player_id: &Uuid, session: &Uuid) -> bool {
+        self.sessions.get(player_id).is_none_or(|s| s == session)
+    }
+
+    /// 対戦中なら負け（ゲームオーバー）として記録してから部屋を抜ける。
+    /// 対戦中の LeaveRoom / Close で勝敗が判定されず部屋が Playing のまま残るのを防ぐ。
+    /// 戻り値: 対戦中だった場合の (room_id, 判定結果)。
+    pub fn leave_room_recording_result(&mut self, player_id: &Uuid) -> Option<(Uuid, WinnerStatus)> {
+        let result = self.room_of(player_id).and_then(|rid| {
+            let playing = self
+                .rooms
+                .get(&rid)
+                .map(|r| r.status == RoomStatus::Playing && r.alive_players.contains(player_id))
+                .unwrap_or(false);
+            if playing {
+                Some((rid, self.record_game_over(player_id)))
+            } else {
+                None
+            }
+        });
+        self.leave_room(player_id);
+        result
+    }
+
+    /// 「ルームに戻る」が選ばれたら、リザルト中の入室制限を解く。
+    pub fn end_post_match(&mut self, room_id: &Uuid) {
+        if let Some(room) = self.rooms.get_mut(room_id) {
+            room.post_match = false;
+        }
+    }
+
+    /// 再接続した人へ送り直す、切断中に起きたかもしれない対戦の状態。
+    /// (room_id, 対戦中に脱落済みの相手, 決着済みならその結果)
+    pub fn reattach_state(&self, player_id: &Uuid) -> Option<(Uuid, Vec<Uuid>, Option<Option<Uuid>>)> {
+        let room_id = self.room_of(player_id)?;
+        let room = self.rooms.get(&room_id)?;
+        match room.status {
+            RoomStatus::Playing => {
+                let dead = room
+                    .players
+                    .iter()
+                    .map(|(pid, _, _)| *pid)
+                    .filter(|pid| pid != player_id && !room.alive_players.contains(pid))
+                    .collect();
+                Some((room_id, dead, None))
+            }
+            RoomStatus::Waiting => {
+                if room.post_match {
+                    Some((room_id, vec![], room.last_result))
+                } else {
+                    None
+                }
+            }
+        }
     }
 
     /// player -> room -> opponent を引く（1対1前提: 同ルームの自分以外のプレイヤー）。
@@ -665,6 +768,7 @@ impl Game {
     pub fn get_live_opponent_reliable_channels(
         &self,
         player_id: &Uuid,
+        target_rule: Option<&str>,
     ) -> Vec<Arc<webrtc::data_channel::RTCDataChannel>> {
         let Some(room_id) = self.player_rooms.get(player_id) else {
             return vec![];
@@ -678,6 +782,7 @@ impl Game {
         room.players
             .iter()
             .filter(|(pid, _, _)| *pid != *player_id && room.alive_players.contains(pid))
+            .filter(|(_, _, rule)| target_rule.is_none_or(|t| t == rule.as_str()))
             .filter_map(|(pid, _, _)| self.get_reliable_connection(pid))
             .collect()
     }
@@ -704,11 +809,13 @@ impl Game {
         if !room.alive_players.contains(player_id) {
             return Err("Garbage sender is no longer alive".to_string());
         }
+        let target = garbage_target_rule(body)?;
         let receiver_rules: Vec<&str> = room
             .players
             .iter()
             .filter(|(pid, _, _)| *pid != *player_id && room.alive_players.contains(pid))
             .map(|(_, _, rule)| rule.as_str())
+            .filter(|rule| target.is_none_or(|t| t == *rule))
             .collect();
         if receiver_rules.is_empty() {
             return Err("Garbage has no live opponent".to_string());
@@ -766,6 +873,8 @@ impl Game {
             ));
         }
         room.status = RoomStatus::Playing;
+        room.post_match = false;
+        room.last_result = None;
         room.alive_players = room.players.iter().map(|(pid, _, _)| *pid).collect();
         // 次のマッチに向けて READY をリセット
         room.ready_players.clear();
@@ -835,6 +944,8 @@ impl Game {
                 room.status = RoomStatus::Waiting;
                 room.alive_players.clear();
                 room.ready_players.clear();
+                room.post_match = true;
+                room.last_result = Some(None);
                 WinnerStatus::Draw
             }
             1 => {
@@ -842,6 +953,8 @@ impl Game {
                 room.status = RoomStatus::Waiting;
                 room.alive_players.clear();
                 room.ready_players.clear();
+                room.post_match = true;
+                room.last_result = Some(Some(winner));
                 WinnerStatus::Winner(winner)
             }
             _ => WinnerStatus::MatchContinues,
@@ -875,6 +988,8 @@ impl Game {
             alive_players: vec![],
             ready_players: vec![],
             pings: std::collections::HashMap::new(),
+            post_match: false,
+            last_result: None,
         };
         self.rooms.insert(room_id, room);
         self.room_codes.insert(code.clone(), room_id);
@@ -889,7 +1004,7 @@ mod tests {
     use tokio::sync::RwLock;
 
     fn garbage_payload(holes: &[u8]) -> Vec<u8> {
-        let mut body = vec![GARBAGE_PROTOCOL_VERSION];
+        let mut body = vec![GARBAGE_PROTOCOL_VERSION_LEGACY];
         body.extend_from_slice(&(holes.len() as u16).to_le_bytes());
         body.extend_from_slice(holes);
         body
@@ -908,17 +1023,115 @@ mod tests {
         assert!(validate_garbage_payload(&garbage_payload(&[]), "tet").is_err());
 
         let mut wrong_version = garbage_payload(&[0]);
-        wrong_version[0] = 2;
+        wrong_version[0] = 3;
         assert!(validate_garbage_payload(&wrong_version, "tet").is_err());
 
         let mut wrong_length = garbage_payload(&[0, 1]);
         wrong_length[1..3].copy_from_slice(&3u16.to_le_bytes());
         assert!(validate_garbage_payload(&wrong_length, "tet").is_err());
 
-        let mut too_large = vec![GARBAGE_PROTOCOL_VERSION];
+        let mut too_large = vec![GARBAGE_PROTOCOL_VERSION_LEGACY];
         too_large.extend_from_slice(&((MAX_GARBAGE_AMOUNT + 1) as u16).to_le_bytes());
         too_large.resize(3 + MAX_GARBAGE_AMOUNT + 1, 0);
         assert!(validate_garbage_payload(&too_large, "tet").is_err());
+    }
+
+    fn targeted_garbage_payload(target: u8, holes: &[u8]) -> Vec<u8> {
+        let mut body = vec![GARBAGE_PROTOCOL_VERSION, target];
+        body.extend_from_slice(&(holes.len() as u16).to_le_bytes());
+        body.extend_from_slice(holes);
+        body
+    }
+
+    #[test]
+    fn targeted_garbage_payload_is_validated() {
+        assert!(validate_garbage_payload(&targeted_garbage_payload(1, &[0, 9]), "tet").is_ok());
+        assert!(validate_garbage_payload(&targeted_garbage_payload(2, &[5]), "puyo").is_ok());
+        assert!(validate_garbage_payload(&targeted_garbage_payload(3, &[0]), "tet").is_err());
+        assert_eq!(garbage_target_rule(&targeted_garbage_payload(1, &[0])), Ok(Some("tet")));
+        assert_eq!(garbage_target_rule(&targeted_garbage_payload(2, &[0])), Ok(Some("puyo")));
+        assert_eq!(garbage_target_rule(&garbage_payload(&[0])), Ok(None));
+        let mut short = targeted_garbage_payload(1, &[0, 1]);
+        short.pop();
+        assert!(validate_garbage_payload(&short, "tet").is_err());
+    }
+
+    /// 混在戦: 宛先ルールの生きている相手がいなければ断る（いれば受ける）
+    #[test]
+    fn targeted_garbage_requires_live_opponent_of_target_rule() {
+        let mut game = Game::default();
+        let owner = Uuid::new_v4();
+        let tet = Uuid::new_v4();
+        let puyo = Uuid::new_v4();
+        let (room_id, _) = game.new_room(
+            owner, "test".to_string(), 3, false, vec![], "owner".to_string(), "tet".to_string(),
+        );
+        game.add_player_to_room(room_id, tet, "t".to_string(), "tet".to_string()).unwrap();
+        game.add_player_to_room(room_id, puyo, "p".to_string(), "puyo".to_string()).unwrap();
+        game.set_ready(&tet, true).unwrap();
+        game.set_ready(&puyo, true).unwrap();
+        game.start_match(room_id).unwrap();
+        assert!(game.validate_garbage(&owner, &targeted_garbage_payload(2, &[0])).is_ok());
+        assert!(game.validate_garbage(&owner, &targeted_garbage_payload(1, &[0])).is_ok());
+        game.record_game_over(&puyo);
+        assert!(game.validate_garbage(&owner, &targeted_garbage_payload(2, &[0])).is_err());
+        assert!(game.validate_garbage(&owner, &targeted_garbage_payload(1, &[0])).is_ok());
+    }
+
+    /// 対戦中の退出は負けとして記録され、残り 1 人なら勝者が決まる。決着後はリザルト中で入室できない
+    #[test]
+    fn leaving_during_match_decides_winner_and_blocks_join_until_room() {
+        let mut game = Game::default();
+        let owner = Uuid::new_v4();
+        let guest = Uuid::new_v4();
+        let late = Uuid::new_v4();
+        let (room_id, _) = game.new_room(
+            owner, "test".to_string(), 3, true, vec![], "owner".to_string(), "tet".to_string(),
+        );
+        game.add_player_to_room(room_id, guest, "g".to_string(), "tet".to_string()).unwrap();
+        game.set_ready(&guest, true).unwrap();
+        game.start_match(room_id).unwrap();
+
+        let result = game.leave_room_recording_result(&guest);
+        assert!(matches!(result, Some((rid, WinnerStatus::Winner(w))) if rid == room_id && w == owner));
+        let room = game.rooms.get(&room_id).unwrap();
+        assert_eq!(room.status, RoomStatus::Waiting);
+        // 残り 1 人になったのでリザルト中の制限は解けている
+        assert!(!room.post_match);
+        assert!(game.add_player_to_room(room_id, late, "l".to_string(), "tet".to_string()).is_ok());
+    }
+
+    #[test]
+    fn join_is_refused_while_result_is_shown() {
+        let mut game = Game::default();
+        let owner = Uuid::new_v4();
+        let guest = Uuid::new_v4();
+        let late = Uuid::new_v4();
+        let (room_id, _) = game.new_room(
+            owner, "test".to_string(), 3, true, vec![], "owner".to_string(), "tet".to_string(),
+        );
+        game.add_player_to_room(room_id, guest, "g".to_string(), "tet".to_string()).unwrap();
+        game.set_ready(&guest, true).unwrap();
+        game.start_match(room_id).unwrap();
+        game.record_game_over(&guest);
+        assert!(game.add_player_to_room(room_id, late, "l".to_string(), "tet".to_string()).is_err());
+        assert_eq!(game.reattach_state(&guest).map(|(_, _, r)| r), Some(Some(Some(owner))));
+        game.end_post_match(&room_id);
+        assert!(game.add_player_to_room(room_id, late, "l".to_string(), "tet".to_string()).is_ok());
+        assert!(game.reattach_state(&guest).is_none());
+    }
+
+    #[test]
+    fn stale_session_is_not_current() {
+        let mut game = Game::default();
+        let pid = Uuid::new_v4();
+        let old = Uuid::new_v4();
+        let new = Uuid::new_v4();
+        assert!(game.is_current_session(&pid, &old));
+        game.set_session(pid, old);
+        game.set_session(pid, new);
+        assert!(!game.is_current_session(&pid, &old));
+        assert!(game.is_current_session(&pid, &new));
     }
 
     #[test]

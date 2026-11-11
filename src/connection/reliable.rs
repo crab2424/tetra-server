@@ -4,7 +4,8 @@ use tokio::sync::RwLock;
 use tracing::{debug, error, info};
 
 use crate::connection::common::{
-    broadcast_json, disconnect_player, notify_room, relay_match_frame, spawn_close_channels,
+    broadcast_json, broadcast_leave_result, disconnect_player, notify_room, relay_match_frame,
+    spawn_close_channels, spawn_send_reattach_state,
 };
 use crate::game::{Game, MatchResult, WinnerStatus};
 use crate::payload;
@@ -32,6 +33,10 @@ pub async fn handle_reliable_connection(
     game: Arc<RwLock<Game>>,
     id: uuid::Uuid,
     pc_weak: std::sync::Weak<webrtc::peer_connection::RTCPeerConnection>,
+    // この接続（PeerConnection）の識別子。古い接続の on_close で復帰済みの人を消さないために渡す
+    session: uuid::Uuid,
+    // 再接続で付け替えた接続か。true なら切断中に起きた対戦の状態を送り直す
+    resync: bool,
 ) -> () {
     // ★ Weak で保持する。on_message が Arc<DC> をキャプチャすると DC が自分自身を参照する
     //   サイクルになり、close 後も Drop されず FD がリークするため（毎回 upgrade して使う）。
@@ -40,6 +45,9 @@ pub async fn handle_reliable_connection(
     game.write()
         .await
         .add_reliable_connection(id, Arc::clone(&dc));
+    if resync {
+        spawn_send_reattach_state(Arc::clone(&game), id, Arc::clone(&dc));
+    }
 
     let game_on_message = Arc::clone(&game);
     dc.on_message(Box::new(move |msg| {
@@ -74,7 +82,9 @@ pub async fn handle_reliable_connection(
                 }
                 let relayed = relay_match_frame(&msg.data, &id);
                 let peer_dcs = if data[0] == payload::Opcode::GarbagePayload as u8 {
-                    game.read().await.get_live_opponent_reliable_channels(&id)
+                    // 宛先ルール付き(v2)なら、そのルールの生きている相手だけへ（validate 済み）
+                    let target = crate::game::garbage_target_rule(&data[1..]).ok().flatten();
+                    game.read().await.get_live_opponent_reliable_channels(&id, target)
                 } else {
                     game.read().await.get_room_peer_channels(&id, true)
                 };
@@ -137,8 +147,8 @@ pub async fn handle_reliable_connection(
                         id
                     );
 
-                    let mut game = game.write().await;
-                    if let Some(state) = game.get_connection_state(&id) {
+                    let mut game_w = game.write().await;
+                    if let Some(state) = game_w.get_connection_state(&id) {
                         let mut state = match state.lock() {
                             Ok(s) => s,
                             Err(e) => {
@@ -148,9 +158,16 @@ pub async fn handle_reliable_connection(
                         };
                         *state = crate::game::ConnectionState::Disconnected;
                     }
-                    let (rel, unrel) = game.remove_connection(&id);
-                    drop(game);
+                    // 対戦中なら負けとして記録してから抜ける（勝敗が判定されず部屋が Playing のまま残らないように）
+                    let room_id = game_w.room_of(&id);
+                    let result = game_w.leave_room_recording_result(&id);
+                    let (rel, unrel) = game_w.remove_connection(&id);
+                    drop(game_w);
                     spawn_close_channels(id, rel, unrel);
+                    if let Some(room_id) = room_id {
+                        notify_room(&game, room_id).await;
+                    }
+                    broadcast_leave_result(&game, id, result).await;
                 }
                 payload::Opcode::JSONRequestPayload => {
                     // MARK: JSONRequestPayload
@@ -393,14 +410,18 @@ pub async fn handle_reliable_connection(
                                 let req_id = req.id;
                                 let room_id = req.room_id;
 
+                                let mut match_result = None;
                                 let leave_result: Result<(), String> = {
                                     let mut g = game.write().await;
-                                    if g.rooms.contains_key(&room_id) {
-                                        // players からの除去と経路表の削除をまとめて行う
-                                        g.leave_room(&id);
-                                        Ok(())
-                                    } else {
+                                    if !g.rooms.contains_key(&room_id) {
                                         Err("Room not found".to_string())
+                                    } else if !g.is_in_room(&id, &room_id) {
+                                        Err("Not in this room".to_string())
+                                    } else {
+                                        // players からの除去と経路表の削除をまとめて行う。
+                                        // 対戦中なら負けとして記録する（残り 1 人なら勝者が決まる）
+                                        match_result = g.leave_room_recording_result(&id);
+                                        Ok(())
                                     }
                                 };
 
@@ -416,6 +437,7 @@ pub async fn handle_reliable_connection(
                                 if leave_result.is_ok() {
                                     // 残ったプレイヤーへ更新を通知（無人で部屋が消えていれば何もしない）
                                     notify_room(&game, room_id).await;
+                                    broadcast_leave_result(&game, id, match_result).await;
                                 }
                             }
 
@@ -697,6 +719,10 @@ pub async fn handle_reliable_connection(
 
                             payload::JsonMessage::JSONUpdatePlayerPingRequest(req) => {
                                 let room_id = req.room_id;
+                                // 送ってきた人の部屋でなければ流さない（他の部屋への通知を防ぐ）
+                                if !game.read().await.is_in_room(&id, &room_id) {
+                                    return;
+                                }
                                 game.write().await.set_ping(&id, req.ping_ms);
                                 // 応答不要（fire-and-forget）。全員の表示を更新する。
                                 notify_room(&game, room_id).await;
@@ -704,6 +730,9 @@ pub async fn handle_reliable_connection(
 
                             payload::JsonMessage::JSONPauseRequest(req) => {
                                 let room_id = req.room_id;
+                                if !game.read().await.is_in_room(&id, &room_id) {
+                                    return;
+                                }
                                 broadcast_json(
                                     &game,
                                     room_id,
@@ -719,6 +748,9 @@ pub async fn handle_reliable_connection(
 
                             payload::JsonMessage::JSONResumeRequest(req) => {
                                 let room_id = req.room_id;
+                                if !game.read().await.is_in_room(&id, &room_id) {
+                                    return;
+                                }
                                 broadcast_json(
                                     &game,
                                     room_id,
@@ -733,7 +765,15 @@ pub async fn handle_reliable_connection(
                                 let req_id = req.id;
                                 let room_id = req.room_id;
 
-                                let winner_status = game.write().await.record_game_over(&id);
+                                // 送ってきた人の部屋でなければ記録も通知もしない
+                                let winner_status = {
+                                    let mut g = game.write().await;
+                                    if g.is_in_room(&id, &room_id) {
+                                        g.record_game_over(&id)
+                                    } else {
+                                        WinnerStatus::MatchContinues
+                                    }
+                                };
 
                                 jsend!(dc_clone, JSONNotifyGameOverResponse {
                                     id: req_id,
@@ -760,6 +800,16 @@ pub async fn handle_reliable_connection(
                             payload::JsonMessage::JSONPostMatchActionRequest(req) => {
                                 let room_id = req.room_id;
                                 let action = req.action;
+                                {
+                                    let mut g = game.write().await;
+                                    if !g.is_in_room(&id, &room_id) {
+                                        return;
+                                    }
+                                    // 1 = ルームに戻る: 全員で部屋へ集合するので、リザルト中の入室制限を解く
+                                    if action == 1 {
+                                        g.end_post_match(&room_id);
+                                    }
+                                }
                                 broadcast_json(
                                     &game,
                                     room_id,
@@ -794,7 +844,7 @@ pub async fn handle_reliable_connection(
         let game = Arc::clone(&game);
         let pc_weak = pc_weak.clone();
         Box::pin(async move {
-            disconnect_player(game, id, Some(pc_weak)).await;
+            disconnect_player(game, id, Some(pc_weak), Some(session)).await;
         })
     }));
 }
