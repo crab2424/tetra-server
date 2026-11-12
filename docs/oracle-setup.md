@@ -36,7 +36,7 @@ bash ~/tetra-server/deploy/setup-oracle.sh tetlabo-canary.duckdns.org <公開IP>
 Oracle 上のメモ：
 
 - パブリック IP は 1:1 NAT でインスタンスの NIC には付かないため，EC2 と同様 **`NAT_1TO1_IP` が必要**（スクリプトが設定する）．
-- `TICKET_PUBLIC_KEY` / `ALLOW_VERSIONS` / `CF_TURN_*` は旧サーバーの `/etc/systemd/system/tetra-server.service.d/override.conf` からコピーして追記し，`sudo systemctl daemon-reload` を実行する（`restart` だけでは反映されない）．
+- `TICKET_PUBLIC_KEY` / `CF_TURN_*`（使う場合）は旧サーバーの `/etc/systemd/system/tetra-server.service.d/override.conf` からコピーして追記し，`sudo systemctl daemon-reload` を実行する（`restart` だけでは反映されない）．
 
 ## 3. 切り替え
 
