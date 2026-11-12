@@ -43,10 +43,15 @@ Oracle 上のメモ：
 1. `sudo systemctl start tetra-server` → `journalctl -u tetra-server` に `NAT 1:1 IP set to <新IP>` が出ること
 2. DuckDNS の IP を新 IP に変更 → `sudo certbot --nginx -d tetlabo-canary.duckdns.org`（DNS 反映前は発行に失敗する）
 3. クライアントから接続・マッチング・対戦を確認（可能なら複数端末で）
-4. GitHub の自動デプロイを新サーバーに向ける
-   - Secrets：`EC2_HOST` を新 IP に，`EC2_SSH_PRIVATE_KEY` を新サーバー用の鍵に
-   - [deploy.yml](../.github/workflows/deploy.yml) の `ec2-user@` を `ubuntu@` に変更
-   - `deploy.sh` は `sudo systemctl restart` を使うので，`ubuntu` ユーザーの sudo はパスワード不要（Ubuntu の既定）
+4. GitHub の自動デプロイを新サーバーに向ける（[deploy.yml](../.github/workflows/deploy.yml) は `ubuntu@` 接続に変更済み）
+   - 既存のデプロイ用鍵（`key/tetra_deploy`）をそのまま使う：Mac から公開鍵を新サーバーの `ubuntu` に登録する
+     ```bash
+     cat key/tetra_deploy.pub | ssh ubuntu@<新IP> 'cat >> ~/.ssh/authorized_keys'
+     ssh -i key/tetra_deploy ubuntu@<新IP> 'echo ok'   # 鍵で入れることを確認
+     ```
+   - Secrets：`EC2_HOST` を新 IP に変更（`EC2_SSH_PRIVATE_KEY` は同じ鍵なので変更不要）
+   - Actions タブの「Deploy to server」を手動実行（Run workflow）して成功することを確認
+   - `deploy.sh` は `sudo systemctl restart` を使うが，`ubuntu` ユーザーの sudo はパスワード不要（Ubuntu の既定）
 5. 数日間は EC2 を残し，問題なければ EC2 を**終了**し，Elastic IP を**解放**する（解放し忘れると課金が続く）
 
 ## 4. 運用上の注意
