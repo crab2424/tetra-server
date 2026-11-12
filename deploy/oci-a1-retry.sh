@@ -13,6 +13,13 @@
 #   - 認証エラー・権限エラー・上限超過（LimitExceeded）など，待っても直らないエラーは即終了．
 #   - 作成に成功したら RUNNING まで待ち，公開 IP を表示して終了する．
 #
+# 終了コード（systemd の Restart=on-failure / RestartPreventExitStatus=2 と組み合わせる）:
+#   0 = 作成に成功，または A1 がすでにある（再起動不要）
+#   1 = 一時的な理由で止まった（ネットワーク不通の連続など．時間をおいて再起動してよい）
+#   2 = 設定・権限・上限のエラー（直すまで再起動しても無駄）
+#
+# 常駐させる場合は deploy/oci-a1-retry.service を systemd に登録する（docs/oracle-setup.md 付録）．
+#
 # 必要なもの: oci (OCI CLI), jq, flock
 set -euo pipefail
 
@@ -20,7 +27,7 @@ CONFIG_FILE="${1:-$HOME/.config/oci-a1-retry.env}"
 if [[ ! -f "$CONFIG_FILE" ]]; then
   echo "設定ファイルがありません: $CONFIG_FILE" >&2
   echo "deploy/oci-a1-retry.env.example をコピーして編集してください．" >&2
-  exit 1
+  exit 2
 fi
 # shellcheck source=/dev/null
 source "$CONFIG_FILE"
@@ -40,19 +47,21 @@ JITTER_SEC="${JITTER_SEC:-30}"
 MAX_BACKOFF_SEC="${MAX_BACKOFF_SEC:-900}"
 MAX_UNKNOWN_ERRORS="${MAX_UNKNOWN_ERRORS:-5}"    # 未知のエラーが連続でこの回数続いたら終了
 NTFY_TOPIC="${NTFY_TOPIC:-}"                     # 設定すると成功・異常終了時に ntfy.sh へ通知
-LOCK_FILE="${LOCK_FILE:-${XDG_RUNTIME_DIR:-/tmp}/oci-a1-retry.lock}"
+# tmux から手動で起動しても systemd から起動しても同じロックを使うよう，HOME 配下に置く
+LOCK_FILE="${LOCK_FILE:-$HOME/.cache/oci-a1-retry.lock}"
 
 # 無料枠（2 OCPU / 12GB）を超える指定は拒否する
 if (( OCPUS > 2 || MEMORY_GB > 12 )); then
   echo "OCPUS=$OCPUS MEMORY_GB=$MEMORY_GB は Always Free の上限（2 OCPU / 12GB）を超えています．" >&2
-  exit 1
+  exit 2
 fi
 
 for cmd in oci jq flock; do
-  command -v "$cmd" >/dev/null || { echo "$cmd が見つかりません．" >&2; exit 1; }
+  command -v "$cmd" >/dev/null || { echo "$cmd が見つかりません（PATH=$PATH）．" >&2; exit 2; }
 done
-[[ -r "$SSH_PUBKEY_FILE" ]] || { echo "SSH 公開鍵が読めません: $SSH_PUBKEY_FILE" >&2; exit 1; }
+[[ -r "$SSH_PUBKEY_FILE" ]] || { echo "SSH 公開鍵が読めません: $SSH_PUBKEY_FILE" >&2; exit 2; }
 
+mkdir -p "$(dirname "$LOCK_FILE")"
 exec 9>"$LOCK_FILE"
 flock -n 9 || { echo "すでに別のプロセスが実行中です（$LOCK_FILE）．" >&2; exit 1; }
 
@@ -63,17 +72,31 @@ notify() {
   curl -fsS -m 10 -H "Title: oci-a1-retry" -d "$1" "https://ntfy.sh/$NTFY_TOPIC" >/dev/null || true
 }
 
+# die <終了コード> <メッセージ>
 die() {
+  local code="$1"; shift
   log "終了: $*"
   notify "A1 取得スクリプトが停止しました: $*"
-  exit 1
+  exit "$code"
+}
+
+# OCI CLI のエラー出力から要点（code / message / 操作 / リクエスト先）を1行にまとめる．
+# JSON として読めなければ先頭 500 文字をそのまま返す．
+summarize_error() {
+  local out="$1" json
+  json="$(printf '%s\n' "$out" | sed -n '/^{/,/^}/p')"
+  if [[ -n "$json" ]] && printf '%s' "$json" | jq -e . >/dev/null 2>&1; then
+    printf '%s' "$json" | jq -r '"\(.status // "?") \(.code // "?"): \(.message // "")" + " [op=\(.operation_name // "?") \(.request_endpoint // "")]"'
+  else
+    printf '%s' "$out" | tr '\n' ' ' | cut -c1-500
+  fi
 }
 
 # 既存の A1 インスタンス（TERMINATED 以外）を数える
 count_existing_a1() {
   local out
   out="$(oci compute instance list --compartment-id "$COMPARTMENT_ID" --all 2>&1)" || {
-    log "インスタンス一覧の取得に失敗: $(echo "$out" | tr '\n' ' ' | cut -c1-300)"
+    log "インスタンス一覧の取得に失敗: $(summarize_error "$out")"
     echo "error"
     return
   }
@@ -92,7 +115,7 @@ if [[ -z "$IMAGE_ID" ]]; then
     --operating-system "Canonical Ubuntu" --operating-system-version "24.04" \
     --shape VM.Standard.A1.Flex --sort-by TIMECREATED --sort-order DESC --limit 1 \
     --query 'data[0].id' --raw-output)"
-  [[ -n "$IMAGE_ID" && "$IMAGE_ID" != "null" ]] || die "Ubuntu 24.04 aarch64 のイメージが見つかりません．IMAGE_ID を指定してください．"
+  [[ -n "$IMAGE_ID" && "$IMAGE_ID" != "null" ]] || die 2 "Ubuntu 24.04 aarch64 のイメージが見つかりません．IMAGE_ID を指定してください．"
   log "Image: $IMAGE_ID"
 fi
 
@@ -108,7 +131,7 @@ while true; do
   existing="$(count_existing_a1)"
   if [[ "$existing" == "error" ]]; then
     unknown_errors=$((unknown_errors + 1))
-    (( unknown_errors >= MAX_UNKNOWN_ERRORS )) && die "一覧取得の失敗が ${unknown_errors} 回続きました．"
+    (( unknown_errors >= MAX_UNKNOWN_ERRORS )) && die 1 "一覧取得の失敗が ${unknown_errors} 回続きました．"
   elif (( existing > 0 )); then
     log "A1 インスタンスがすでに ${existing} 台あります．終了します．"
     exit 0
@@ -143,7 +166,7 @@ while true; do
       exit 0
     fi
 
-    msg="$(echo "$out" | tr '\n' ' ' | cut -c1-300)"
+    msg="$(summarize_error "$out")"
     case "$out" in
       *"Out of host capacity"*|*"out of host capacity"*)
         log "#${attempt} 容量不足"
@@ -153,16 +176,16 @@ while true; do
         log "#${attempt} 429 TooManyRequests → ${backoff}s 待機"
         unknown_errors=0 ;;
       *LimitExceeded*|*QuotaExceeded*)
-        die "上限超過（LimitExceeded）．無料枠をすでに使い切っていないか確認してください: $msg" ;;
+        die 2 "上限超過（LimitExceeded）．無料枠をすでに使い切っていないか確認してください: $msg" ;;
       *NotAuthenticated*|*NotAuthorizedOrNotFound*|*'"status": 401'*|*'"status": 404'*|*InvalidParameter*|*'"status": 400'*)
-        die "設定・権限のエラー: $msg" ;;
+        die 2 "設定・権限のエラー: $msg" ;;
       *InternalError*|*'"status": 500'*|*'"status": 502'*|*'"status": 503'*|*"timed out"*|*"Connection"*)
         log "#${attempt} 一時的なエラー: $msg"
         backoff="$INTERVAL_SEC"; unknown_errors=0 ;;
       *)
         unknown_errors=$((unknown_errors + 1))
         log "#${attempt} 不明なエラー（${unknown_errors}/${MAX_UNKNOWN_ERRORS}）: $msg"
-        (( unknown_errors >= MAX_UNKNOWN_ERRORS )) && die "不明なエラーが ${unknown_errors} 回続きました．" ;;
+        (( unknown_errors >= MAX_UNKNOWN_ERRORS )) && die 1 "不明なエラーが ${unknown_errors} 回続きました．" ;;
     esac
   fi
 
