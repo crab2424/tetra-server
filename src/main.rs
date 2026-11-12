@@ -50,7 +50,7 @@ macro_rules! nest {
 const ROOM_SWEEP_INTERVAL_SECS: u64 = 60;
 
 /// 通信プロトコル番号（設計: source_assets/memory/v2.2.1/tetlabo-protocol-version-design.md）。
-/// アプリのバージョン(ALLOW_VERSIONS)とは別に、接続を許可するかどうかを決める値。
+/// アプリのバージョン文字列とは別に、接続を許可するかどうかを決める唯一の値。
 /// 次のいずれかを変えたときだけ +1 し、クライアント側の同名定数
 /// (src/online/protocol_version.ts の PROTOCOL_VERSION)も同時に上げる:
 ///   1. シグナリング(WebSocketのJSON)の形式
@@ -81,41 +81,23 @@ const PROTOCOL_VERSION: u32 = 3;
 /// 公開と同時にデプロイする（旧版はリロードで新版になる）。
 const SUPPORTED_PROTOCOL_VERSIONS: &[u32] = &[3];
 
-/// Offer の再接続で `reconnect_secret` の一致を必須にし始めたプロトコル番号。
-/// これ未満のクライアントはそもそも secret を送らない実装なので、必須にすると
-/// 試合中の切断からの復帰(player_id 再バインド)ができなくなる。互換ウィンドウで
-/// 受け入れている以上、旧クライアントに限り secret 無しの再バインドを許可する
-/// （＝protocol 1 時代と同じ挙動。乗っ取り耐性も当時と同じで、新クライアントには影響しない）。
-const RECONNECT_SECRET_REQUIRED_PROTOCOL: u32 = 2;
-
 /// 認証判定を接続処理から切り出したもの（単体テスト用）。
-/// `protocol` が Some なら SUPPORTED_PROTOCOL_VERSIONS に含まれるかで判定する（新クライアント）。
-/// `protocol` が None の旧クライアント（2.2.0以前）は、移行期間として従来どおり
-/// ALLOW_VERSIONS(アプリのバージョン文字列)で判定する。
+/// `protocol` が SUPPORTED_PROTOCOL_VERSIONS に含まれるときだけ許可する。
+/// `protocol` を送らない旧クライアント（2.2.0以前）は拒否する（以前はアプリのバージョン文字列
+/// ALLOW_VERSIONS で移行期間の互換判定をしていたが、protocol 3 で旧規則を締め出したため廃止）。
 /// 戻り値: Ok(())=許可 / Err(拒否メッセージ)。
-fn check_auth(version: &str, protocol: Option<u32>, allow_versions: &[String]) -> Result<(), String> {
+fn check_auth(protocol: Option<u32>) -> Result<(), String> {
     match protocol {
-        Some(p) => {
-            if SUPPORTED_PROTOCOL_VERSIONS.contains(&p) {
-                Ok(())
-            } else {
-                Err(format!(
-                    "Unsupported protocol version: {p}. Server protocol version: {PROTOCOL_VERSION} \
-                     (supported: {SUPPORTED_PROTOCOL_VERSIONS:?}).\n\
-                     Please reload or reopen the client to update to a supported version."
-                ))
-            }
-        }
-        None => {
-            if allow_versions.iter().any(|v| v == version) {
-                Ok(())
-            } else {
-                Err(format!(
-                    "Unsupported client version: {version}. Allowed versions: {allow_versions:?}\n\
-                     Please reload or reopen the client to update to a supported version."
-                ))
-            }
-        }
+        Some(p) if SUPPORTED_PROTOCOL_VERSIONS.contains(&p) => Ok(()),
+        Some(p) => Err(format!(
+            "Unsupported protocol version: {p}. Server protocol version: {PROTOCOL_VERSION} \
+             (supported: {SUPPORTED_PROTOCOL_VERSIONS:?}).\n\
+             Please reload or reopen the client to update to a supported version."
+        )),
+        None => Err(format!(
+            "Unsupported client: protocol version not sent. Server protocol version: {PROTOCOL_VERSION}.\n\
+             Please reload or reopen the client to update to a supported version."
+        )),
     }
 }
 
@@ -141,7 +123,6 @@ struct AppState {
     game: Arc<RwLock<game::Game>>,
     api: Arc<webrtc::api::API>,
     config: RTCConfiguration,
-    allow_versions: Vec<String>,
     /// online アカウント化(設計 v2.2.2 §7)。TICKET_PUBLIC_KEY が未設定/不正なら None
     /// になり、その場合は誰が送っても常にチケット検証をスキップして全員ゲスト扱いにする
     /// （移行時・鍵未発行時にオンライン対戦自体を止めないため）。
@@ -350,9 +331,6 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     ));
 
     let mut version_authenticated = false;
-    // Auth で受理したクライアントのプロトコル番号（送ってこない旧クライアントは None）。
-    // 再接続時に reconnect_secret を必須にするかの判定に使う。
-    let mut authed_protocol: Option<u32> = None;
 
     while let Some(Ok(msg)) = ws_receiver.next().await {
         if let Message::Text(text) = msg {
@@ -382,16 +360,12 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     //    state を Establishing に戻して disconnect_player の猶予removalを止める
                     //    （新しい両チャネルが揃えば check_if_ready が Connected に進める）。
                     if let Some(rid) = reconnect_id {
-                        // 互換ウィンドウで受けている旧クライアント(protocol < 2 / protocol無し)は
-                        // secret を送らない実装なので、その場合だけ secret 無しの再バインドを許す。
-                        let legacy_client = authed_protocol
-                            .is_none_or(|p| p < RECONNECT_SECRET_REQUIRED_PROTOCOL);
                         let rebind_allowed = {
                             let g = game_for_loop.read().await;
                             let exists = g.get_connection_state(&rid).is_some();
                             let secret_matches = offered_secret.is_some()
                                 && g.reconnect_secret_of(&rid) == offered_secret;
-                            exists && (secret_matches || (legacy_client && offered_secret.is_none()))
+                            exists && secret_matches
                         };
                         if rebind_allowed {
                             // 今のこの接続自身のAuthで発行された使い捨てのsecretを rid 側へ
@@ -521,7 +495,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     }
                 }
                 signaling::SignalMessage::Auth { version, protocol, ticket } => {
-                    if let Err(message) = check_auth(&version, protocol, &state.allow_versions) {
+                    if let Err(message) = check_auth(protocol) {
                         error!(
                             "Rejected connection with unsupported client (version={version}, protocol={protocol:?}): {message}"
                         );
@@ -543,7 +517,6 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         break;
                     } else {
                         info!("Client authenticated with version: {version}, protocol: {protocol:?}");
-                        authed_protocol = protocol;
 
                         // online アカウント化(設計 v2.2.2 §7.2): チケットがあれば検証する。
                         // TICKET_PUBLIC_KEY未設定(=ticket_verifierがNone)ならそもそも検証せず、
@@ -795,11 +768,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         game,
         api,
         config,
-        allow_versions: env::var("ALLOW_VERSIONS")
-            .unwrap_or_else(|_| "0.0.0".to_string())
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .collect(),
         ticket_verifier,
     };
 
@@ -844,21 +812,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::*;
 
-    fn allow_versions() -> Vec<String> {
-        vec!["2.1.0".to_string(), "2.1.1".to_string(), "2.2.0".to_string()]
-    }
-
     #[test]
     fn protocol_match_is_allowed() {
-        assert!(check_auth("2.2.1", Some(PROTOCOL_VERSION), &allow_versions()).is_ok());
+        assert!(check_auth(Some(PROTOCOL_VERSION)).is_ok());
     }
 
     #[test]
-    fn protocol_mismatch_is_rejected_even_if_version_is_allowed() {
-        // versionがALLOW_VERSIONSに載っていても、SUPPORTED_PROTOCOL_VERSIONS に
-        // 含まれないprotocolなら拒否する。
-        assert!(check_auth("2.1.1", Some(PROTOCOL_VERSION + 1), &allow_versions()).is_err());
-        assert!(check_auth("2.1.1", Some(0), &allow_versions()).is_err());
+    fn unknown_protocol_is_rejected() {
+        assert!(check_auth(Some(PROTOCOL_VERSION + 1)).is_err());
+        assert!(check_auth(Some(0)).is_err());
     }
 
     #[test]
@@ -869,9 +831,8 @@ mod tests {
 
     #[test]
     fn supported_protocol_versions_are_allowed() {
-        // 互換ウィンドウに載っている番号は、ALLOW_VERSIONS に無いバージョン文字列でも protocol で通ること。
         for p in SUPPORTED_PROTOCOL_VERSIONS {
-            assert!(check_auth("2.4.0", Some(*p), &[]).is_ok());
+            assert!(check_auth(Some(*p)).is_ok());
         }
     }
 
@@ -879,19 +840,13 @@ mod tests {
     fn old_rule_protocol_versions_are_rejected() {
         // protocol 3 は破壊的変更（おじゃまの穴を受ける側が決める・Garbage v2）。
         // 旧規則のクライアント(protocol 1/2)は同じ部屋で混ざらないよう締め出す。
-        assert!(check_auth("2.2.1", Some(1), &allow_versions()).is_err());
-        assert!(check_auth("2.3.1", Some(2), &allow_versions()).is_err());
+        assert!(check_auth(Some(1)).is_err());
+        assert!(check_auth(Some(2)).is_err());
     }
 
     #[test]
-    fn no_protocol_falls_back_to_allow_versions() {
-        // 旧クライアント（2.2.0以前）はprotocolを送らない＝移行期間はversion文字列で判定する。
-        assert!(check_auth("2.1.1", None, &allow_versions()).is_ok());
-        assert!(check_auth("1.3.0", None, &allow_versions()).is_err());
-    }
-
-    #[test]
-    fn no_protocol_and_empty_allow_versions_is_rejected() {
-        assert!(check_auth("2.2.0", None, &[]).is_err());
+    fn no_protocol_is_rejected() {
+        // protocol を送らない旧クライアント（2.2.0以前）は、バージョン文字列に関係なく拒否する。
+        assert!(check_auth(None).is_err());
     }
 }

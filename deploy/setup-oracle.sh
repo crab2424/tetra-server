@@ -53,7 +53,7 @@ sudo tee /etc/systemd/system/tetra-server.service.d/override.conf >/dev/null <<E
 Environment=NAT_1TO1_IP=$PUBLIC_IP
 Environment=ICE_UDP_PORT_RANGE=50000-50999
 Environment=TICKET_AUDIENCE=$DOMAIN
-# TICKET_PUBLIC_KEY / ALLOW_VERSIONS / CF_TURN_* は旧サーバーの override.conf からコピーしてここに追記する
+# TICKET_PUBLIC_KEY / CF_TURN_*（使う場合）は旧サーバーの override.conf からコピーしてここに追記する
 EOF
 sudo systemctl daemon-reload
 sudo systemctl enable tetra-server
@@ -81,7 +81,7 @@ sudo nginx -t && sudo systemctl reload nginx
 cat <<EOF
 
 セットアップ完了。残りは手動:
-  1. 旧サーバーの override.conf から TICKET_PUBLIC_KEY / ALLOW_VERSIONS / CF_TURN_* を
+  1. 旧サーバーの override.conf から TICKET_PUBLIC_KEY / CF_TURN_*（使う場合）を
      /etc/systemd/system/tetra-server.service.d/override.conf に追記し daemon-reload
   2. DuckDNS の IP を $PUBLIC_IP に切り替え
   3. sudo certbot --nginx -d $DOMAIN   (443 の設定は certbot が追加する)

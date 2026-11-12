@@ -50,8 +50,8 @@ pub enum SignalMessage {
     Auth {
         version: String,
         /// 通信プロトコル番号（設計: source_assets/memory/v2.2.1/tetlabo-protocol-version-design.md）。
-        /// 旧クライアント（2.2.0以前）はこのフィールドを送らない。Noneのときは移行期間として
-        /// 従来どおり ALLOW_VERSIONS(version文字列)で判定する（main.rs::check_auth 参照）。
+        /// 旧クライアント（2.2.0以前）はこのフィールドを送らない。None は拒否する
+        /// （拒否理由を返せるよう、欠けていてもパース自体は通す。main.rs::check_auth 参照）。
         #[serde(default)]
         protocol: Option<u32>,
         /// Cloudflare Worker が発行した短寿命チケット（online アカウント化。設計 v2.2.2 §7.1）。
