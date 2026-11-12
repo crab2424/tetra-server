@@ -1,0 +1,34 @@
+# Ampere A1 自動取得スクリプト（deploy/oci-a1-retry.sh）を常駐させる systemd ユニット．
+# インスタンスが再起動しても自動で再開する．A1 を作成できたら（終了コード 0）止まったままになる．
+#
+# 登録: sudo cp ~/tetra-server/deploy/oci-a1-retry.service /etc/systemd/system/
+#       sudo systemctl daemon-reload && sudo systemctl enable --now oci-a1-retry
+# ログ: journalctl -u oci-a1-retry -f
+# 停止: sudo systemctl disable --now oci-a1-retry
+#
+# ユーザー名が ubuntu 以外なら User= と /home/ubuntu を書き換える．
+
+[Unit]
+Description=Retry creating an OCI Ampere A1 instance until capacity is available
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Environment=HOME=/home/ubuntu
+# pipx で入れた oci は ~/.local/bin にある
+Environment=PATH=/home/ubuntu/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/bin/bash /home/ubuntu/tetra-server/deploy/oci-a1-retry.sh /home/ubuntu/.config/oci-a1-retry.env
+
+# 1 = 一時的な停止 → 5 分後に再起動．2 = 設定・権限・上限のエラー → 直すまで再起動しない．
+Restart=on-failure
+RestartSec=300
+RestartPreventExitStatus=2
+
+# 1GB の Micro で tetra-server を圧迫しないように
+Nice=10
+MemoryMax=400M
+
+[Install]
+WantedBy=multi-user.target

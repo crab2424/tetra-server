@@ -85,19 +85,27 @@ Oracle 上のメモ：
 
    既存の公開鍵（Mac の `~/.ssh/*.pub`）を Micro に置いて `SSH_PUBKEY_FILE` に指定してもよい．
 
-3. tmux で起動して放置する（SSH を切っても続く）
+3. systemd に登録して常駐させる（SSH を切っても，インスタンスが再起動しても続く）
 
    ```bash
-   tmux new -s a1
-   bash ~/tetra-server/deploy/oci-a1-retry.sh 2>&1 | tee -a ~/oci-a1-retry.log
-   # Ctrl-b d で抜ける．戻るときは tmux attach -t a1
+   sudo cp ~/tetra-server/deploy/oci-a1-retry.service /etc/systemd/system/
+   sudo systemctl daemon-reload
+   sudo systemctl enable --now oci-a1-retry
+   journalctl -u oci-a1-retry -f        # 「#1 容量不足」が約 2 分ごとに出れば OK（Ctrl-C で表示を抜けても止まらない）
    ```
+
+   - 状態確認：`systemctl status oci-a1-retry`．止める：`sudo systemctl disable --now oci-a1-retry`
+   - 設定ファイルを直したら `sudo systemctl restart oci-a1-retry`
+   - ユーザー名が `ubuntu` 以外なら，ユニットの `User=` と `/home/ubuntu` を書き換えてから登録する
+   - 一時的に試すだけなら tmux 内で `bash ~/tetra-server/deploy/oci-a1-retry.sh` を直接実行してもよい（同時に 2 つは動かない）
 
 スクリプトの挙動：
 
 - 試行のたびに A1 インスタンスの有無を確認し，すでにあれば何もせず終了する（二重作成しない）．
 - 容量不足なら約 2 分ごとに再試行．429（リクエスト過多）なら間隔を倍に延ばす．
-- 認証・権限・上限超過などのエラーは待っても直らないので即終了する．ログを見て設定を直す．
+- 認証・権限・上限超過などのエラーは待っても直らないので即終了する（systemd も再起動しない）．ログを見て設定を直し，`restart` する．
+- ネットワーク不通などで止まった場合は，systemd が 5 分後に自動で再起動する．
+- A1 を作成できたら終了し，systemd も再起動しない．取得後は `sudo systemctl disable oci-a1-retry` で登録を外しておく．
 - `NTFY_TOPIC` を設定すると，成功時・停止時にスマホの ntfy アプリへ通知が届く．
 
 作成後：
