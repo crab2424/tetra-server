@@ -54,3 +54,49 @@ Oracle 上のメモ：
 - **アイドル回収**：7 日間，CPU・ネットワーク・（Arm は）メモリの使用率が 95 パーセンタイルで 20% 未満だと回収されうる．メールの通知を見逃さないこと．止まっても `git clone` とこの手順で再作成できる．
 - **死活監視**：無料の外形監視（UptimeRobot 等）で `https://<ドメイン>/` を見ておくと，止まったことにすぐ気づける．
 - 1 週間ほど運用して回収や不安定さが出るなら，国内 VPS（KAGOYA / さくら）へ同じ手順で移行できる．
+
+## 付録：Ampere A1 を自動で取得する
+
+「out of host capacity」で A1 が作れないときは，[deploy/oci-a1-retry.sh](../deploy/oci-a1-retry.sh) を **tetlabo の Micro 上**で動かし，作成できるまで繰り返し試す．Micro の無料枠（2 台）と A1 の無料枠（2 OCPU / 12GB）は別なので，Micro 2 台を残したまま A1 を作れる．
+
+1. OCI CLI と jq を入れる（`cargo build` 中は避ける．メモリ不足になりやすい）
+
+   ```bash
+   sudo apt-get install -y pipx jq
+   pipx install oci-cli && pipx ensurepath && exec $SHELL -l
+   oci setup config        # 質問に答えると ~/.oci/config と API 鍵ができる
+   ```
+
+   表示された公開鍵（`~/.oci/oci_api_key_public.pem`）を，コンソールの「プロファイル → My profile → API keys → Add API key → Paste a public key」に登録する．`oci iam region list` が通れば OK．
+
+2. 新インスタンス用の SSH 鍵と設定ファイルを用意する
+
+   ```bash
+   ssh-keygen -t ed25519 -f ~/.ssh/tetlabo_a1 -N ''   # 秘密鍵は Mac にもコピーしておく
+   mkdir -p ~/.config
+   cp ~/tetra-server/deploy/oci-a1-retry.env.example ~/.config/oci-a1-retry.env
+   nano ~/.config/oci-a1-retry.env                     # COMPARTMENT_ID / SUBNET_ID を記入
+   ```
+
+   既存の公開鍵（Mac の `~/.ssh/*.pub`）を Micro に置いて `SSH_PUBKEY_FILE` に指定してもよい．
+
+3. tmux で起動して放置する（SSH を切っても続く）
+
+   ```bash
+   tmux new -s a1
+   bash ~/tetra-server/deploy/oci-a1-retry.sh 2>&1 | tee -a ~/oci-a1-retry.log
+   # Ctrl-b d で抜ける．戻るときは tmux attach -t a1
+   ```
+
+スクリプトの挙動：
+
+- 試行のたびに A1 インスタンスの有無を確認し，すでにあれば何もせず終了する（二重作成しない）．
+- 容量不足なら約 2 分ごとに再試行．429（リクエスト過多）なら間隔を倍に延ばす．
+- 認証・権限・上限超過などのエラーは待っても直らないので即終了する．ログを見て設定を直す．
+- `NTFY_TOPIC` を設定すると，成功時・停止時にスマホの ntfy アプリへ通知が届く．
+
+作成後：
+
+- 公開 IP はエフェメラルで作られる．固定したい場合は，コンソールでエフェメラル IP を外して Reserved public IP を付け直す．
+- 以降は「2. サーバー上の作業」と同じ手順で A1 をセットアップする（Ubuntu 24.04 aarch64）．
+- 何日経っても取れない場合は Pay As You Go への切り替えを検討する（無料枠内なら課金なし．予算アラートを設定しておく）．
