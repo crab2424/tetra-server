@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
-# EC2上で実行されるデプロイスクリプト。GitHub Actionsからssh経由で呼ばれる。
+# サーバー上で実行されるデプロイスクリプト。GitHub Actionsからssh経由で呼ばれる。
 set -euo pipefail
+
+# ssh で直接コマンドを実行すると非対話シェルになり，Ubuntu の ~/.bashrc は冒頭で抜けるため
+# rustup が追記した PATH 設定が読まれない（cargo: command not found になる）。明示的に読み込む。
+if [ -f "$HOME/.cargo/env" ]; then
+  # shellcheck disable=SC1091
+  source "$HOME/.cargo/env"
+fi
 
 cd ~/tetra-server
 

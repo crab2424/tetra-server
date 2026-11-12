@@ -1,4 +1,4 @@
-name: Deploy to EC2
+name: Deploy to server
 
 on:
   push:
@@ -22,7 +22,10 @@ jobs:
           chmod 600 ~/.ssh/deploy_key
           ssh-keyscan -H "${{ secrets.EC2_HOST }}" >> ~/.ssh/known_hosts
 
+      # 接続先は Oracle Cloud（Ubuntu）．Secrets 名は EC2 時代のまま（EC2_HOST = サーバーの公開IP）．
+      # 先に最新の main を取得してから deploy.sh を実行する（実行中のスクリプト自身を
+      # git reset で書き換えないため）．bash -l で ~/.profile を読み，cargo を PATH に入れる．
       - name: Deploy
         run: |
-          ssh -i ~/.ssh/deploy_key ec2-user@"${{ secrets.EC2_HOST }}" \
-            'bash ~/tetra-server/deploy/deploy.sh'
+          ssh -i ~/.ssh/deploy_key ubuntu@"${{ secrets.EC2_HOST }}" \
+            'cd ~/tetra-server && git fetch origin main && git reset --hard origin/main && bash -l deploy/deploy.sh'
