@@ -746,7 +746,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // （鍵未発行のローカル開発や移行期間でオンライン対戦自体を止めないため）。
     let ticket_verifier: Option<Arc<Mutex<account::TicketVerifier>>> = {
         let raw_keys = env::var("TICKET_PUBLIC_KEY").unwrap_or_default();
-        let audience = env::var("TICKET_AUDIENCE").unwrap_or_default();
+        let audiences = account::parse_audiences(&env::var("TICKET_AUDIENCE").unwrap_or_default());
         let keys = account::parse_public_keys(&raw_keys);
         if keys.is_empty() {
             info!(
@@ -755,11 +755,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             None
         } else {
             info!(
-                "Ticket verification enabled: {} public key(s), audience={audience:?}",
+                "Ticket verification enabled: {} public key(s), audience={audiences:?}",
                 keys.len()
             );
+            if audiences.is_empty() {
+                warn!("TICKET_AUDIENCE is empty; every ticket will be rejected and all connections become guests");
+            }
             Some(Arc::new(Mutex::new(account::TicketVerifier::new(
-                keys, audience,
+                keys, audiences,
             ))))
         }
     };

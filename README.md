@@ -38,4 +38,4 @@ $ cargo run
 | `CF_TURN_TOKEN_ID`  | Cloudflare TURN のトークンIDを指定します (指定されない場合は，TURNは利用されません．) | `xxxx`           |
 | `CF_TURN_API_TOKEN` | Cloudflare TURN の APIトークンを指定します                                            | `xxxx`           |
 | `TICKET_PUBLIC_KEY` | online アカウント（Discord連携）のチケット署名検証に使う Ed25519 公開鍵（raw 32byte の base64．カンマ区切りで複数指定可＝鍵ローテーション用）．未設定・不正な場合はアカウント機能が無効になり，全接続がゲスト扱いになります | `xxxx`           |
-| `TICKET_AUDIENCE`   | チケットの `aud`（自ホスト名）と一致するか検証します．他サーバー向けに発行されたチケットの流用を防ぎます | `tetlabo-canary.duckdns.org` |
+| `TICKET_AUDIENCE`   | チケットの `aud`（自ホスト名）と一致するか検証します．他サーバー向けに発行されたチケットの流用を防ぎます．カンマ区切りで複数指定可（ドメイン移行中に新旧両方を許可する用．大文字小文字は区別しない）．空の場合は全チケットを拒否し全員ゲスト扱いになります | `api.tetlabo.com,tetlabo-canary.duckdns.org` |
