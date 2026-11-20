@@ -72,6 +72,16 @@ pub fn parse_public_keys(env_value: &str) -> Vec<VerifyingKey> {
         .collect()
 }
 
+/// `TICKET_AUDIENCE` をパースする。カンマ区切りで複数指定可(ドメイン移行中に新旧両方の
+/// ホスト名を許可するため)。前後の空白と空要素は無視し、ホスト名は大文字小文字を区別しない。
+pub fn parse_audiences(env_value: &str) -> Vec<String> {
+    env_value
+        .split(',')
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
 fn parse_ticket(ticket: &str) -> Result<(Vec<u8>, Signature), TicketError> {
     let (payload_b64, sig_b64) = ticket.split_once('.').ok_or(TicketError::Malformed)?;
     let payload_bytes = URL_SAFE_NO_PAD
@@ -84,18 +94,19 @@ fn parse_ticket(ticket: &str) -> Result<(Vec<u8>, Signature), TicketError> {
     Ok((payload_bytes, Signature::from_bytes(&sig_bytes)))
 }
 
-/// チケット検証器。公開鍵(ローテーション用に複数可)・自ホスト名(audience)・jti再利用防止表を保持する。
+/// チケット検証器。公開鍵(ローテーション用に複数可)・自ホスト名(audience。ドメイン移行用に複数可)・
+/// jti再利用防止表を保持する。
 pub struct TicketVerifier {
     public_keys: Vec<VerifyingKey>,
-    audience: String,
+    audiences: Vec<String>,
     seen_jti: HashMap<String, i64>,
 }
 
 impl TicketVerifier {
-    pub fn new(public_keys: Vec<VerifyingKey>, audience: String) -> Self {
+    pub fn new(public_keys: Vec<VerifyingKey>, audiences: Vec<String>) -> Self {
         Self {
             public_keys,
-            audience,
+            audiences,
             seen_jti: HashMap::new(),
         }
     }
@@ -119,7 +130,11 @@ impl TicketVerifier {
         if payload.v != 1 {
             return Err(TicketError::UnsupportedVersion(payload.v));
         }
-        if payload.aud != self.audience {
+        if !self
+            .audiences
+            .iter()
+            .any(|aud| aud.eq_ignore_ascii_case(&payload.aud))
+        {
             return Err(TicketError::WrongAudience);
         }
         if now > payload.exp + CLOCK_SKEW_SECS {
@@ -176,7 +191,7 @@ mod tests {
     }
 
     fn verifier(key: &SigningKey) -> TicketVerifier {
-        TicketVerifier::new(vec![key.verifying_key()], TEST_AUD.to_string())
+        TicketVerifier::new(vec![key.verifying_key()], vec![TEST_AUD.to_string()])
     }
 
     #[test]
@@ -224,7 +239,7 @@ mod tests {
         // ローテーション中: 新旧両方の公開鍵を許可しておけば旧鍵で発行されたチケットも通る。
         let mut v = TicketVerifier::new(
             vec![new_key.verifying_key(), old_key.verifying_key()],
-            TEST_AUD.to_string(),
+            vec![TEST_AUD.to_string()],
         );
         assert!(v.verify(&ticket, 1_050).is_ok());
     }
@@ -239,6 +254,30 @@ mod tests {
             verifier(&key).verify(&ticket, 1_050),
             Err(TicketError::WrongAudience)
         );
+    }
+
+    #[test]
+    fn domain_migration_accepts_either_configured_audience() {
+        let key = signing_key(1);
+        // 移行中: 新旧どちらのホスト名宛てに発行されたチケットも通る。
+        let audiences = parse_audiences(" api.tetlabo.com , TETLABO-canary.duckdns.org ,");
+        assert_eq!(audiences, vec!["api.tetlabo.com", "tetlabo-canary.duckdns.org"]);
+        let mut v = TicketVerifier::new(vec![key.verifying_key()], audiences);
+        let old = make_ticket(&key, |_| {});
+        let new = make_ticket(&key, |p| {
+            p["aud"] = serde_json::Value::String("api.tetlabo.com".to_string());
+            p["jti"] = serde_json::Value::String("nonce-2".to_string());
+        });
+        assert!(v.verify(&old, 1_050).is_ok());
+        assert!(v.verify(&new, 1_050).is_ok());
+    }
+
+    #[test]
+    fn empty_audience_rejects_every_ticket() {
+        let key = signing_key(1);
+        let ticket = make_ticket(&key, |_| {});
+        let mut v = TicketVerifier::new(vec![key.verifying_key()], parse_audiences(""));
+        assert_eq!(v.verify(&ticket, 1_050), Err(TicketError::WrongAudience));
     }
 
     #[test]
