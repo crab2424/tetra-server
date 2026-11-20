@@ -2,6 +2,7 @@
 /logs
 /key
 /token
+/docs
 **/.*
 !/.github/
 !/.github/**

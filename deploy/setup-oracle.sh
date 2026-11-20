@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Oracle Cloud (Ubuntu 22.04/24.04) の新規インスタンス初期セットアップ。
 # インスタンス上で一度だけ実行する:  bash setup-oracle.sh <ドメイン> <パブリックIP>
-# 例: bash setup-oracle.sh tetlabo-canary.duckdns.org 203.0.113.10
+# 例: bash setup-oracle.sh api.tetlabo.com 203.0.113.10
 set -euo pipefail
 
 DOMAIN="${1:?usage: setup-oracle.sh <domain> <public-ip>}"
