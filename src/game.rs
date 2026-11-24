@@ -97,7 +97,8 @@ pub fn validate_garbage_payload(body: &[u8], receiver_rule: &str) -> Result<(), 
 
 /// オンライン対戦で CPU 対戦設定から独立して使う標準ルール。
 /// ランダムマッチと通常のルームマッチの初期値をサーバー側で統一する。
-pub const ONLINE_DEFAULT_MATCH_SETTING: &str = r#"{"setTarget":1,"holdEnabled":true,"b2bBonus":true,"garbageMultiplier":1.0,"marginTime":96,"garbageHoleRate":70,"garbageDamageOnClear":true,"ojamaRate":70}"#;
+/// marginEnabled: MARGIN の ON/OFF（OFF ならマージンに入らない）。marginTime 0 は INSTANT（即時突入）で OFF ではない
+pub const ONLINE_DEFAULT_MATCH_SETTING: &str = r#"{"setTarget":1,"holdEnabled":true,"b2bBonus":true,"garbageMultiplier":1.0,"marginEnabled":true,"marginTime":96,"garbageHoleRate":70,"garbageDamageOnClear":true,"ojamaRate":70}"#;
 
 /// ZONE BATTLE の部屋の既定（設計 §4。クライアントのローカル ZONE BATTLE の既定
 /// public/config/vs_settings.js DEFAULT_ZONE_BATTLE_SETTINGS と手で合わせる）。
@@ -319,7 +320,7 @@ fn sanitize_match_setting(setting: &str, battle: Battle) -> Result<String, Strin
 
     for (key, value) in object {
         match key.as_str() {
-            "holdEnabled" | "b2bBonus" | "garbageDamageOnClear" => {
+            "holdEnabled" | "b2bBonus" | "garbageDamageOnClear" | "marginEnabled" => {
                 if !value.is_boolean() {
                     return Err(format!("{key} must be a boolean"));
                 }
@@ -1810,6 +1811,13 @@ mod tests {
         assert!(ok(&table(row(0, 0), row(25000, 64000), row(40000, 128000))).is_err());
         assert!(ok(&table(row(0, 0), row(20000, 64000), row(40000, 100000))).is_err());
         assert!(ok(r#"{"phaseTable":[]}"#).is_err());
+        // VERSUS の部屋にも MARGIN の ON/OFF（真偽値のみ）
+        assert_eq!(
+            sanitize_match_setting(r#"{"marginEnabled":false,"marginTime":0}"#, Battle::Versus).unwrap(),
+            r#"{"marginEnabled":false,"marginTime":0}"#
+        );
+        assert!(sanitize_match_setting(r#"{"marginEnabled":"no"}"#, Battle::Versus).is_err());
+        assert!(sanitize_match_setting(ONLINE_DEFAULT_MATCH_SETTING, Battle::Versus).unwrap().contains(r#""marginEnabled":true"#));
         // VERSUS の部屋は従来どおり（ZONE のキーは捨てる）
         let vs = sanitize_match_setting(r#"{"zoneSplit":true,"marginTime":100}"#, Battle::Versus).unwrap();
         assert_eq!(vs, r#"{"marginTime":100}"#);
