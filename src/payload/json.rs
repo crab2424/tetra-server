@@ -148,3 +148,51 @@ impl JsonMessage {
         Ok(payload.to_binary()?)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// クライアント（src/online/payload.ts isZonePhaseNotification / ZonePhaseNotification）が読む形
+    #[test]
+    fn zone_phase_notification_wire_shape() {
+        let room_id = Uuid::nil();
+        let msg = JsonMessage::JSONZonePhaseNotification(JSONZonePhaseNotification {
+            room_id,
+            phase: 2,
+            margin_step: None,
+        });
+        let v: serde_json::Value = serde_json::to_value(&msg).unwrap();
+        assert_eq!(v["type"], "JSONZonePhaseNotification");
+        assert_eq!(v["roomId"], room_id.to_string());
+        assert_eq!(v["phase"], 2);
+        assert!(v["marginStep"].is_null());
+        let msg = JsonMessage::JSONZonePhaseNotification(JSONZonePhaseNotification {
+            room_id,
+            phase: 3,
+            margin_step: Some(1),
+        });
+        assert_eq!(serde_json::to_value(&msg).unwrap()["marginStep"], 1);
+    }
+
+    /// 作成要求の battle は省略できる（無ければ VERSUS）。部屋情報・一覧には battle が入る
+    #[test]
+    fn create_room_battle_is_optional() {
+        let req: JsonMessage = serde_json::from_str(
+            r#"{"type":"JSONCreateRoomRequest","id":"00000000-0000-0000-0000-000000000000","roomName":"a","maxPlayers":2,"isPublic":true,"tags":[],"username":"u","rule":"tet"}"#,
+        )
+        .unwrap();
+        match req {
+            JsonMessage::JSONCreateRoomRequest(r) => assert!(r.battle.is_none()),
+            _ => panic!("unexpected message"),
+        }
+        let req: JsonMessage = serde_json::from_str(
+            r#"{"type":"JSONCreateRoomRequest","id":"00000000-0000-0000-0000-000000000000","roomName":"a","maxPlayers":2,"isPublic":true,"tags":[],"username":"u","rule":"tet","battle":"zone"}"#,
+        )
+        .unwrap();
+        match req {
+            JsonMessage::JSONCreateRoomRequest(r) => assert_eq!(r.battle.as_deref(), Some("zone")),
+            _ => panic!("unexpected message"),
+        }
+    }
+}
