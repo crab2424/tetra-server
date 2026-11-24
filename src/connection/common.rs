@@ -76,6 +76,26 @@ pub async fn broadcast_json(
     }
 }
 
+/// 部屋の RoomInfoNotification を作る（notify_room と RoomInfoNotificationRequest の応答で共通）。
+pub fn room_info_notification(game: &Game, room_id: Uuid) -> Option<payload::JSONRoomInfoNotification> {
+    let room = game.rooms.get(&room_id)?;
+    Some(payload::JSONRoomInfoNotification {
+        room_id,
+        owner_id: room.owner,
+        room_name: room.room_name.clone(),
+        players: room.players.clone(),
+        max_players: room.max_players,
+        tags: room.tags.iter().map(|t| *t as u32).collect(),
+        match_setting: room.match_setting.clone(),
+        ready_players: room.ready_players.clone(),
+        pings: room.pings.iter().map(|(pid, ms)| (*pid, *ms)).collect(),
+        code: room.code.clone(),
+        is_public: room.is_public,
+        accounts: game.room_accounts(&room_id),
+        battle: room.battle.as_str().to_string(),
+    })
+}
+
 /// 指定ルームに居る全プレイヤーの reliable チャンネルへ RoomInfoNotification をプッシュする。
 /// 参加・退出・マッチ成立でルーム構成が変わったときに各クライアントへ伝えるための関数。
 /// 注意: 内部で game ロックを取得するため、呼び出し側はロックを保持していないこと。
@@ -85,21 +105,8 @@ pub async fn notify_room(game: &Arc<RwLock<Game>>, room_id: Uuid) {
         let Some(room) = game.rooms.get(&room_id) else {
             return;
         };
-        let owner_id = room.owner;
-        let accounts = game.room_accounts(&room_id);
-        let notif = payload::JSONRoomInfoNotification {
-            room_id,
-            owner_id,
-            room_name: room.room_name.clone(),
-            players: room.players.clone(),
-            max_players: room.max_players,
-            tags: room.tags.iter().map(|t| *t as u32).collect(),
-            match_setting: room.match_setting.clone(),
-            ready_players: room.ready_players.clone(),
-            pings: room.pings.iter().map(|(pid, ms)| (*pid, *ms)).collect(),
-            code: room.code.clone(),
-            is_public: room.is_public,
-            accounts,
+        let Some(notif) = room_info_notification(&game, room_id) else {
+            return;
         };
         let body = payload::JsonMessage::JSONRoomInfoNotification(notif)
             .to_response_body()

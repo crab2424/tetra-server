@@ -95,5 +95,7 @@ schemas! {
         PendingUpdate, 0x29, (data, Vec<u8>);
         HoldState, 0x2A, (data, Vec<u8>);
         StatsUpdate, 0x2B, (data, Vec<u8>);
+        // ZONE BATTLE: 相手に ZONE（メーター・発動・終了）を見せる固定 12 バイト（PROTOCOL 4。中身は見ずに中継）
+        ZoneState, 0x2C, (data, Vec<u8>);
     }
 }

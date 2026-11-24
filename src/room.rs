@@ -20,6 +20,47 @@ pub enum RoomStatus {
     Playing,
 }
 
+/// 部屋の種類（ZONE BATTLE ONLINE 設計 §3）。部屋を作るときに決め、後から変えない。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Battle {
+    /// 通常の VERSUS（テト・ぷよ）
+    Versus,
+    /// ZONE BATTLE（テトのみ。フェーズ・SCORE のマージンはサーバーが通知する）
+    Zone,
+}
+
+impl Battle {
+    /// クライアントの値（"versus" | "zone"）から。知らない値・無しは VERSUS
+    pub fn from_wire(v: Option<&str>) -> Self {
+        match v {
+            Some("zone") => Battle::Zone,
+            _ => Battle::Versus,
+        }
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Battle::Versus => "versus",
+            Battle::Zone => "zone",
+        }
+    }
+}
+
+/// ZONE BATTLE の対戦中の進み具合（サーバーが StatsUpdate のスコアから決めて全員へ通知する。設計 §5）。
+/// 対戦の頭（start_match）で作り直す。
+#[derive(Clone, Debug, Default)]
+pub struct ZoneProgress {
+    /// PHASE TRIGGER: SCORE のときの 02・03 へ進む点（試合の始まりからの値）。フェーズなし・TIME は None
+    pub phase_scores: Option<[u32; 2]>,
+    /// MARGIN TRIGGER: SCORE のときの突入の点。それ以外は None
+    pub margin_score: Option<u32>,
+    /// 部屋の全員（脱落した人も含む）のスコアの最大値
+    pub max_score: u32,
+    /// いまのフェーズ（1〜3）
+    pub phase: u8,
+    /// いまのマージンの段階（None = 未突入、0〜5）
+    pub margin_step: Option<u8>,
+}
+
 #[derive(Clone)]
 pub struct Room {
     /// 部屋の状態
@@ -54,4 +95,8 @@ pub struct Room {
     /// 直前のマッチの結果（Some(Some(勝者)) / Some(None)=引き分け / None=結果なし）。
     /// 切断中に決着した人が再接続したとき、WinnerNotification を送り直すために持つ。
     pub last_result: Option<Option<Uuid>>,
+    /// 部屋の種類（作った後は変えない）
+    pub battle: Battle,
+    /// ZONE BATTLE の対戦中の進み具合（VERSUS の部屋では使わない）
+    pub zone: ZoneProgress,
 }
