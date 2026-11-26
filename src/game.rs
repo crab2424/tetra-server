@@ -7,7 +7,7 @@ use webrtc::data_channel::RTCDataChannel;
 use webrtc::data_channel::data_channel_state::RTCDataChannelState;
 
 use crate::account::Account;
-use crate::room::{Room, RoomStatus};
+use crate::room::{Battle, Room, RoomStatus, ZoneProgress};
 
 /// 宛先なしの旧形式（PROTOCOL 1/2 のクライアント）。生きている相手全員へ中継する。
 pub const GARBAGE_PROTOCOL_VERSION_LEGACY: u8 = 1;
@@ -16,8 +16,14 @@ pub const GARBAGE_PROTOCOL_VERSION_LEGACY: u8 = 1;
 /// 混在 3 人以上の対戦では 1 回の攻撃で tet 向け（ライン数）・puyo 向け（おじゃま個数）の 2 本が
 /// 飛ぶので、target のルールの相手だけへ中継する（宛先が無いと受け手が違う単位で読んでしまう）。
 pub const GARBAGE_PROTOCOL_VERSION: u8 = 2;
+/// 版 3（PROTOCOL 4 のクライアント。ZONE BATTLE ONLINE 設計 §6.2）:
+/// version(=3) + target:u8 + flags:u8 + amount:u16(LE) + holes:u8[amount]。
+/// flags bit0 = zoneChunk（かたまりごとに穴を引き直す）、bit1 = zoneHold（1 手に 1 かたまり）。
+/// ZONE 以外の火力も版 3（flags = 0）で届く。印はテト向けだけ（ぷよ向けは 0 でなければ断る）。
+pub const GARBAGE_PROTOCOL_VERSION_ZONE: u8 = 3;
+pub const GARBAGE_FLAGS_MASK: u8 = 0b0000_0011;
 pub const MAX_GARBAGE_AMOUNT: usize = 1_000;
-pub const MAX_GARBAGE_FRAME_BYTES: usize = 1 + 1 + 1 + 2 + MAX_GARBAGE_AMOUNT;
+pub const MAX_GARBAGE_FRAME_BYTES: usize = 1 + 1 + 1 + 1 + 2 + MAX_GARBAGE_AMOUNT;
 pub const GARBAGE_RATE_LIMIT: usize = 60;
 pub const GARBAGE_RATE_WINDOW_SECS: u64 = 1;
 
@@ -25,7 +31,7 @@ pub const GARBAGE_RATE_WINDOW_SECS: u64 = 1;
 pub fn garbage_target_rule(body: &[u8]) -> Result<Option<&'static str>, String> {
     match body.first() {
         Some(&GARBAGE_PROTOCOL_VERSION_LEGACY) => Ok(None),
-        Some(&GARBAGE_PROTOCOL_VERSION) => match body.get(1) {
+        Some(&GARBAGE_PROTOCOL_VERSION) | Some(&GARBAGE_PROTOCOL_VERSION_ZONE) => match body.get(1) {
             Some(1) => Ok(Some("tet")),
             Some(2) => Ok(Some("puyo")),
             Some(t) => Err(format!("Invalid Garbage target: {t}")),
@@ -38,11 +44,23 @@ pub fn garbage_target_rule(body: &[u8]) -> Result<Option<&'static str>, String> 
 
 /// Garbage 本体を検証し、受信側ルールに応じた穴/列の値を返す。
 pub fn validate_garbage_payload(body: &[u8], receiver_rule: &str) -> Result<(), String> {
-    // 版ごとの「amount の位置」。旧形式は version の直後、新形式は version + target の後
-    let header = match garbage_target_rule(body)? {
-        None => 1,
-        Some(_) => 2,
+    // 版ごとの「amount の位置」。旧形式は version の直後、版 2 は version + target の後、
+    // 版 3 は version + target + flags の後
+    let target = garbage_target_rule(body)?;
+    let header = match (target, body.first()) {
+        (None, _) => 1,
+        (Some(_), Some(&GARBAGE_PROTOCOL_VERSION_ZONE)) => 3,
+        (Some(_), _) => 2,
     };
+    if header == 3 {
+        let flags = *body.get(2).ok_or_else(|| "Garbage payload is too short".to_string())?;
+        if flags & !GARBAGE_FLAGS_MASK != 0 {
+            return Err(format!("Invalid Garbage flags: {flags:#04x}"));
+        }
+        if flags != 0 && target != Some("tet") {
+            return Err("Garbage ZONE flags are only for TET receivers".to_string());
+        }
+    }
     if body.len() < header + 2 {
         return Err("Garbage payload is too short".to_string());
     }
@@ -79,24 +97,230 @@ pub fn validate_garbage_payload(body: &[u8], receiver_rule: &str) -> Result<(), 
 
 /// オンライン対戦で CPU 対戦設定から独立して使う標準ルール。
 /// ランダムマッチと通常のルームマッチの初期値をサーバー側で統一する。
-pub const ONLINE_DEFAULT_MATCH_SETTING: &str = r#"{"setTarget":1,"holdEnabled":true,"b2bBonus":true,"garbageMultiplier":1.0,"marginTime":96,"garbageHoleRate":70,"garbageDamageOnClear":true,"ojamaRate":70}"#;
+/// marginEnabled: MARGIN の ON/OFF（OFF ならマージンに入らない）。marginTime 0 は INSTANT（即時突入）で OFF ではない
+pub const ONLINE_DEFAULT_MATCH_SETTING: &str = r#"{"setTarget":1,"holdEnabled":true,"b2bBonus":true,"garbageMultiplier":1.0,"marginEnabled":true,"marginTime":96,"garbageHoleRate":70,"garbageDamageOnClear":true,"ojamaRate":70}"#;
+
+/// ZONE BATTLE の部屋の既定（設計 §4。クライアントのローカル ZONE BATTLE の既定
+/// public/config/vs_settings.js DEFAULT_ZONE_BATTLE_SETTINGS と手で合わせる）。
+pub const ONLINE_DEFAULT_ZONE_MATCH_SETTING: &str = r#"{"setTarget":1,"garbageMultiplier":1.0,"holdEnabled":true,"b2bBonus":true,"garbageDamageOnClear":false,"zoneSplit":true,"marginEnabled":true,"marginTrigger":"time","marginTime":96,"marginScore":20000,"phase":true,"phaseTrigger":"score","phaseTable":[{"holeRate":90,"holeChunk":90,"zoneTime":5000,"zoneCharge":6,"scoreAdd":0,"timeAdd":0},{"holeRate":90,"holeChunk":10,"zoneTime":4000,"zoneCharge":8,"scoreAdd":20000,"timeAdd":64000},{"holeRate":10,"holeChunk":10,"zoneTime":2500,"zoneCharge":10,"scoreAdd":40000,"timeAdd":128000}],"garbageHoleRate":90,"garbageHoleChunk":10,"zoneQuarterMs":5000,"zoneQuarterLines":6}"#;
+
+/// 部屋の種類ごとの既定の部屋設定
+pub fn default_match_setting(battle: Battle) -> &'static str {
+    match battle {
+        Battle::Versus => ONLINE_DEFAULT_MATCH_SETTING,
+        Battle::Zone => ONLINE_DEFAULT_ZONE_MATCH_SETTING,
+    }
+}
+
+// ── ZONE BATTLE の部屋設定の選択肢（クライアントと手で合わせる。設計 §4・§12）──
+// MARGIN TIME（秒。public/config/vs_settings.js MARGIN_TIME_STEPS）
+const ZONE_MARGIN_TIME_STEPS: &[i64] = &[-160, -128, -96, -64, -32, 0, 32, 64, 96, 128, 160, 192];
+// MARGIN SCORE（突入の点。MARGIN_SCORE_STEPS）
+const ZONE_MARGIN_SCORE_STEPS: &[i64] = &[0, 20000, 40000, 80000, 100000, 160000, 200000];
+// MARGIN TRIGGER: SCORE の 1 段階の点・段階の上限（public/game/tet/zone.js TET_MARGIN_SCORE_STEP / TET_MARGIN_MAX_STEP_SCORE）
+pub const ZONE_MARGIN_SCORE_STEP: u32 = 20000;
+pub const ZONE_MARGIN_MAX_STEP: u8 = 5;
+// PHASE 02・03 へ進むしきい値（前のフェーズに足す値。PHASE_SCORE_STEPS / PHASE_TIME_STEPS）
+const ZONE_PHASE_SCORE_STEPS: &[i64] = &[10000, 20000, 30000, 40000, 60000, 80000, 100000, 120000, 160000, 200000];
+const ZONE_PHASE_TIME_STEPS: &[i64] = &[16000, 32000, 48000, 64000, 96000, 128000, 160000, 192000, 256000, 320000];
+// ZONE TIME（1/4 の長さ ms）・ZONE CHARGE（1/4 のライン数）（public/game/tet/zone.js ZONE_QUARTER_MS_OPTIONS / ZONE_QUARTER_LINES_OPTIONS）
+const ZONE_TIME_OPTIONS: &[i64] = &[2500, 4000, 5000, 8000, 10000, 15000];
+const ZONE_CHARGE_OPTIONS: &[i64] = &[3, 4, 6, 8, 10, 12];
+
+/// 整数で、選択肢のどれかであること
+fn int_in(key: &str, value: &serde_json::Value, options: &[i64]) -> Result<(), String> {
+    match value.as_i64() {
+        Some(v) if options.contains(&v) => Ok(()),
+        _ => Err(format!("{key} must be one of {options:?}")),
+    }
+}
+
+/// HOLE RATE: 0〜100 の 10 刻みの整数
+fn hole_rate(key: &str, value: &serde_json::Value) -> Result<(), String> {
+    match value.as_i64() {
+        Some(v) if (0..=100).contains(&v) && v % 10 == 0 => Ok(()),
+        _ => Err(format!("{key} must be an integer between 0 and 100 in steps of 10")),
+    }
+}
+
+/// PHASE 01〜03 の表（3 行。行の中の知らないキーは捨てる）
+fn sanitize_phase_table(value: &serde_json::Value) -> Result<serde_json::Value, String> {
+    let rows = value
+        .as_array()
+        .filter(|rows| rows.len() == 3)
+        .ok_or_else(|| "phaseTable must be an array of 3 rows".to_string())?;
+    let mut out = Vec::with_capacity(3);
+    for (i, row) in rows.iter().enumerate() {
+        let row = row
+            .as_object()
+            .ok_or_else(|| "phaseTable rows must be objects".to_string())?;
+        let mut clean = serde_json::Map::new();
+        for (key, v) in row {
+            match key.as_str() {
+                "holeRate" | "holeChunk" => hole_rate(key, v)?,
+                "zoneTime" => int_in(key, v, ZONE_TIME_OPTIONS)?,
+                "zoneCharge" => int_in(key, v, ZONE_CHARGE_OPTIONS)?,
+                // 01 は 0 固定（開始時）。02・03 は前のフェーズに足す値
+                "scoreAdd" if i == 0 => int_in(key, v, &[0])?,
+                "timeAdd" if i == 0 => int_in(key, v, &[0])?,
+                "scoreAdd" => int_in(key, v, ZONE_PHASE_SCORE_STEPS)?,
+                "timeAdd" => int_in(key, v, ZONE_PHASE_TIME_STEPS)?,
+                unknown => {
+                    warn!("Ignoring unknown phaseTable key: {unknown}");
+                    continue;
+                }
+            }
+            clean.insert(key.clone(), v.clone());
+        }
+        out.push(serde_json::Value::Object(clean));
+    }
+    Ok(serde_json::Value::Array(out))
+}
+
+/// ZONE BATTLE の部屋の設定の検査（知らないキー・VERSUS だけのキーは捨てる。知っているキーの値異常はエラー）
+fn sanitize_zone_match_setting(object: &serde_json::Map<String, serde_json::Value>) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    let mut sanitized = serde_json::Map::new();
+    for (key, value) in object {
+        match key.as_str() {
+            "holdEnabled" | "b2bBonus" | "garbageDamageOnClear" | "zoneSplit" | "marginEnabled" | "phase" => {
+                if !value.is_boolean() {
+                    return Err(format!("{key} must be a boolean"));
+                }
+            }
+            "setTarget" => {
+                let number = value
+                    .as_f64()
+                    .ok_or_else(|| format!("{key} must be a number"))?;
+                if number.fract() != 0.0 || number < 1.0 || number > 9.0 {
+                    return Err(format!("{key} must be an integer between 1 and 9"));
+                }
+            }
+            "garbageMultiplier" => {
+                let number = value
+                    .as_f64()
+                    .ok_or_else(|| format!("{key} must be a number"))?;
+                if !number.is_finite() || !(0.0..=3.0).contains(&number) {
+                    return Err(format!("{key} must be between 0 and 3"));
+                }
+            }
+            "marginTrigger" | "phaseTrigger" => {
+                let ok = match key.as_str() {
+                    "marginTrigger" => matches!(value.as_str(), Some("time") | Some("score")),
+                    _ => matches!(value.as_str(), Some("score") | Some("time")),
+                };
+                if !ok {
+                    return Err(format!("{key} must be \"time\" or \"score\""));
+                }
+            }
+            "marginTime" => int_in(key, value, ZONE_MARGIN_TIME_STEPS)?,
+            "marginScore" => int_in(key, value, ZONE_MARGIN_SCORE_STEPS)?,
+            "garbageHoleRate" | "garbageHoleChunk" => hole_rate(key, value)?,
+            "zoneQuarterMs" => int_in(key, value, ZONE_TIME_OPTIONS)?,
+            "zoneQuarterLines" => int_in(key, value, ZONE_CHARGE_OPTIONS)?,
+            "phaseTable" => {
+                sanitized.insert(key.clone(), sanitize_phase_table(value)?);
+                continue;
+            }
+            unknown => {
+                warn!("Ignoring unknown ZONE BATTLE match setting key: {unknown}");
+                continue;
+            }
+        }
+        sanitized.insert(key.clone(), value.clone());
+    }
+    Ok(sanitized)
+}
+
+/// ZONE BATTLE の部屋設定から、サーバーが見るしきい値（SCORE のフェーズ・SCORE のマージン）を読む。
+/// 対戦の頭（start_match）で 1 回だけ読む（StatsUpdate のたびに JSON を読まない）。
+pub fn zone_progress_from_setting(setting: &str) -> ZoneProgress {
+    let v: serde_json::Value = serde_json::from_str(setting).unwrap_or(serde_json::Value::Null);
+    let default: serde_json::Value =
+        serde_json::from_str(ONLINE_DEFAULT_ZONE_MATCH_SETTING).unwrap_or(serde_json::Value::Null);
+    // 無いキーは既定（クライアントの parseZoneMatchSetting も同じ）
+    let get = |key: &str| -> serde_json::Value {
+        v.get(key).cloned().unwrap_or_else(|| default.get(key).cloned().unwrap_or(serde_json::Value::Null))
+    };
+    let phase_on = get("phase").as_bool().unwrap_or(true);
+    let phase_by_score = get("phaseTrigger").as_str() != Some("time");
+    let phase_scores = if phase_on && phase_by_score {
+        let table = get("phaseTable");
+        let add = |i: usize| -> u32 {
+            table
+                .get(i)
+                .and_then(|r| r.get("scoreAdd"))
+                .and_then(|x| x.as_u64())
+                .or_else(|| default["phaseTable"][i]["scoreAdd"].as_u64())
+                .unwrap_or(0) as u32
+        };
+        let p2 = add(1);
+        Some([p2, p2.saturating_add(add(2))])
+    } else {
+        None
+    };
+    let margin_by_score = get("marginEnabled").as_bool().unwrap_or(true)
+        && get("marginTrigger").as_str() == Some("score");
+    let margin_score = if margin_by_score {
+        get("marginScore").as_u64().map(|x| x as u32)
+    } else {
+        None
+    };
+    ZoneProgress {
+        phase_scores,
+        margin_score,
+        max_score: 0,
+        phase: 1,
+        // 突入 0 点は即時（段階 0）。クライアントの _zoneInit も同じなので通知しない
+        margin_step: if margin_score == Some(0) { Some(0) } else { None },
+    }
+}
+
+/// 最大スコアからフェーズ（1〜3）と SCORE のマージンの段階を求める（zone.js zonePhaseForScore・_zoneBattleCheck と同じ）
+pub fn zone_targets(progress: &ZoneProgress, max_score: u32) -> (u8, Option<u8>) {
+    let phase = match progress.phase_scores {
+        Some([p2, p3]) => {
+            if max_score >= p3 {
+                3
+            } else if max_score >= p2 {
+                2
+            } else {
+                1
+            }
+        }
+        None => 1,
+    };
+    let step = progress.margin_score.and_then(|m| {
+        if max_score >= m {
+            Some(((max_score - m) / ZONE_MARGIN_SCORE_STEP).min(ZONE_MARGIN_MAX_STEP as u32) as u8)
+        } else {
+            None
+        }
+    });
+    (phase, step)
+}
 
 /// 既知キーのみを検証・再シリアライズして返す。未知キーはクライアントの先行
 /// リリース（新設定の追加）で既存設定が丸ごと拒否されないよう、エラーにせず
 /// 警告ログを出して黙って捨てる（[[project-tetra-server]] 「フレーム拡張は
 /// サーバー無改造で可能」と同じ前方互換方針）。既知キーの値異常は従来通りエラー。
-fn sanitize_match_setting(setting: &str) -> Result<String, String> {
+fn sanitize_match_setting(setting: &str, battle: Battle) -> Result<String, String> {
     let value: serde_json::Value = serde_json::from_str(setting)
         .map_err(|_| "Match setting must be valid JSON".to_string())?;
     let object = value
         .as_object()
         .ok_or_else(|| "Match setting must be a JSON object".to_string())?;
 
+    if battle == Battle::Zone {
+        let sanitized = sanitize_zone_match_setting(object)?;
+        return serde_json::to_string(&sanitized)
+            .map_err(|e| format!("Failed to serialize match setting: {e}"));
+    }
+
     let mut sanitized = serde_json::Map::new();
 
     for (key, value) in object {
         match key.as_str() {
-            "holdEnabled" | "b2bBonus" | "garbageDamageOnClear" => {
+            "holdEnabled" | "b2bBonus" | "garbageDamageOnClear" | "marginEnabled" => {
                 if !value.is_boolean() {
                     return Err(format!("{key} must be a boolean"));
                 }
@@ -390,6 +614,9 @@ impl Game {
         if room.players.len() as u8 >= room.max_players {
             return Err("Room is full".to_string());
         }
+        // ZONE BATTLE の部屋は全員テト（設計 §3）。コードで入る人は部屋の種類を知らずにふだんの
+        // ルール（ぷよのこともある）で来るので、断らずにテトで入れる（ルールの変更は update_player_rule が断る）
+        let rule = if room.battle == Battle::Zone { "tet".to_string() } else { rule };
         room.players.push((player_id, username, rule));
         // 入室直後は未READY状態（再入室時の stale READY も除去）
         room.ready_players.retain(|pid| *pid != player_id);
@@ -415,6 +642,9 @@ impl Game {
             "tet" | "puyo" => {}
             _ => return Err("Invalid rule".to_string()),
         }
+        if room.battle == Battle::Zone && rule != "tet" {
+            return Err("ZONE BATTLE rooms are TET only".to_string());
+        }
         if let Some(entry) = room.players.iter_mut().find(|(pid, _, _)| pid == player_id) {
             entry.2 = rule;
         }
@@ -430,11 +660,11 @@ impl Game {
         room_id: Uuid,
         setting: String,
     ) -> Result<String, String> {
-        let sanitized = sanitize_match_setting(&setting)?;
         let room = self
             .rooms
             .get_mut(&room_id)
             .ok_or_else(|| "Room not found".to_string())?;
+        let sanitized = sanitize_match_setting(&setting, room.battle)?;
         if room.owner != *player_id {
             return Err("Only the room owner can change match settings".to_string());
         }
@@ -548,6 +778,7 @@ impl Game {
                 }
             };
             // 待機していた相手をオーナーにしてルームを作成（相手は player[0] として入る）
+            // ランダムマッチは VERSUS だけ（設計 §3・回答 5）
             let (room_id, _code) = self.new_room(
                 opp_id,
                 "Random Match".to_string(),
@@ -556,6 +787,7 @@ impl Game {
                 vec![],
                 opp_name,
                 opp_rule,
+                Battle::Versus,
             );
             let _ = self.add_player_to_room(room_id, player_id, username, rule);
             MatchResult::Matched {
@@ -834,6 +1066,56 @@ impl Game {
         Ok(())
     }
 
+    /// ZONE BATTLE の部屋で対戦中か（StatsUpdate のたびに書き込みロックを取らないための先読み）
+    pub fn in_zone_match(&self, player_id: &Uuid) -> bool {
+        self.player_rooms
+            .get(player_id)
+            .and_then(|room_id| self.rooms.get(room_id))
+            .is_some_and(|room| room.battle == Battle::Zone && room.status == RoomStatus::Playing)
+    }
+
+    /// ZONE BATTLE: StatsUpdate（0x2B）の中身からスコアを読み、部屋の全員のスコアの最大値で
+    /// フェーズ・SCORE のマージンの段階が上がったら Some((部屋, フェーズ, 段階)) を返す（設計 §5）。
+    /// 呼び出し側が部屋の全員へ JSONZonePhaseNotification を送る。一度上がったら下げない。
+    /// 脱落した人のスコアも数える（最大値は下がらないので単調。§13 Q1）。
+    /// body は opcode を除いた中身: rule:u8(0=tet) + score:u32(LE) + …
+    pub fn record_zone_score(&mut self, player_id: &Uuid, body: &[u8]) -> Option<(Uuid, u8, Option<u8>)> {
+        if body.len() < 5 || body[0] != 0 {
+            return None;
+        }
+        let score = u32::from_le_bytes([body[1], body[2], body[3], body[4]]);
+        let room_id = self.player_rooms.get(player_id).copied()?;
+        let room = self.rooms.get_mut(&room_id)?;
+        if room.battle != Battle::Zone || room.status != RoomStatus::Playing {
+            return None;
+        }
+        if !room.players.iter().any(|(pid, _, _)| pid == player_id) {
+            return None;
+        }
+        let z = &mut room.zone;
+        if score <= z.max_score {
+            return None;
+        }
+        z.max_score = score;
+        let (phase, step) = zone_targets(z, score);
+        let phase_up = phase > z.phase;
+        let step_up = match (step, z.margin_step) {
+            (Some(s), Some(cur)) => s > cur,
+            (Some(_), None) => true,
+            _ => false,
+        };
+        if !phase_up && !step_up {
+            return None;
+        }
+        if phase_up {
+            z.phase = phase;
+        }
+        if step_up {
+            z.margin_step = step;
+        }
+        Some((room_id, z.phase, z.margin_step))
+    }
+
     /// ルーム全メンバーの reliable チャンネルを収集する（通知配布用）。
     pub fn get_room_reliable_channels(&self, room_id: &Uuid) -> Vec<Arc<RTCDataChannel>> {
         let Some(room) = self.rooms.get(room_id) else {
@@ -878,6 +1160,12 @@ impl Game {
         room.alive_players = room.players.iter().map(|(pid, _, _)| *pid).collect();
         // 次のマッチに向けて READY をリセット
         room.ready_players.clear();
+        // ZONE BATTLE: フェーズ・マージンの進み具合を 0 に戻す（セットの次の試合・RETRY も。設計 §5.2）
+        room.zone = if room.battle == Battle::Zone {
+            zone_progress_from_setting(&room.match_setting)
+        } else {
+            ZoneProgress::default()
+        };
         let seed: [u8; 16] = *Uuid::new_v4().as_bytes();
         let match_setting = room.match_setting.clone();
         Ok((seed, match_setting))
@@ -972,9 +1260,12 @@ impl Game {
         tags: Vec<crate::room::RoomTag>,
         owner_username: String,
         owner_rule: String,
+        battle: Battle,
     ) -> (Uuid, String) {
         let room_id = Uuid::new_v4();
         let code = self.generate_room_code();
+        // ZONE BATTLE の部屋は全員テト（作成者も）
+        let owner_rule = if battle == Battle::Zone { "tet".to_string() } else { owner_rule };
         let room = Room {
             status: RoomStatus::Waiting,
             owner,
@@ -984,12 +1275,14 @@ impl Game {
             is_public,
             tags,
             code: code.clone(),
-            match_setting: ONLINE_DEFAULT_MATCH_SETTING.to_string(),
+            match_setting: default_match_setting(battle).to_string(),
             alive_players: vec![],
             ready_players: vec![],
             pings: std::collections::HashMap::new(),
             post_match: false,
             last_result: None,
+            battle,
+            zone: ZoneProgress::default(),
         };
         self.rooms.insert(room_id, room);
         self.room_codes.insert(code.clone(), room_id);
@@ -1064,7 +1357,7 @@ mod tests {
         let tet = Uuid::new_v4();
         let puyo = Uuid::new_v4();
         let (room_id, _) = game.new_room(
-            owner, "test".to_string(), 3, false, vec![], "owner".to_string(), "tet".to_string(),
+            owner, "test".to_string(), 3, false, vec![], "owner".to_string(), "tet".to_string(), Battle::Versus,
         );
         game.add_player_to_room(room_id, tet, "t".to_string(), "tet".to_string()).unwrap();
         game.add_player_to_room(room_id, puyo, "p".to_string(), "puyo".to_string()).unwrap();
@@ -1086,7 +1379,7 @@ mod tests {
         let guest = Uuid::new_v4();
         let late = Uuid::new_v4();
         let (room_id, _) = game.new_room(
-            owner, "test".to_string(), 3, true, vec![], "owner".to_string(), "tet".to_string(),
+            owner, "test".to_string(), 3, true, vec![], "owner".to_string(), "tet".to_string(), Battle::Versus,
         );
         game.add_player_to_room(room_id, guest, "g".to_string(), "tet".to_string()).unwrap();
         game.set_ready(&guest, true).unwrap();
@@ -1108,7 +1401,7 @@ mod tests {
         let guest = Uuid::new_v4();
         let late = Uuid::new_v4();
         let (room_id, _) = game.new_room(
-            owner, "test".to_string(), 3, true, vec![], "owner".to_string(), "tet".to_string(),
+            owner, "test".to_string(), 3, true, vec![], "owner".to_string(), "tet".to_string(), Battle::Versus,
         );
         game.add_player_to_room(room_id, guest, "g".to_string(), "tet".to_string()).unwrap();
         game.set_ready(&guest, true).unwrap();
@@ -1146,7 +1439,7 @@ mod tests {
             false,
             vec![],
             "owner".to_string(),
-            "tet".to_string(),
+            "tet".to_string(), Battle::Versus,
         );
         game.add_player_to_room(room_id, guest, "guest".to_string(), "puyo".to_string())
             .unwrap();
@@ -1175,7 +1468,7 @@ mod tests {
             false,
             vec![],
             "owner".to_string(),
-            "tet".to_string(),
+            "tet".to_string(), Battle::Versus,
         );
         game.add_player_to_room(room_id, guest, "guest".to_string(), "puyo".to_string())
             .expect("guest should join");
@@ -1208,7 +1501,7 @@ mod tests {
             false,
             vec![],
             "owner".to_string(),
-            "tet".to_string(),
+            "tet".to_string(), Battle::Versus,
         );
         game.add_player_to_room(room_id, guest, "guest".to_string(), "puyo".to_string())
             .expect("guest should join");
@@ -1243,7 +1536,7 @@ mod tests {
             false,
             vec![],
             "owner".to_string(),
-            "tet".to_string(),
+            "tet".to_string(), Battle::Versus,
         );
         game.add_player_to_room(room_id, guest, "guest".to_string(), "puyo".to_string())
             .expect("guest should join");
@@ -1319,7 +1612,7 @@ mod tests {
             false,
             vec![],
             "A".to_string(),
-            "tet".to_string(),
+            "tet".to_string(), Battle::Versus,
         );
         game.add_player_to_room(room_id, b, "B".to_string(), "tet".to_string())
             .expect("B joins");
@@ -1355,7 +1648,7 @@ mod tests {
             false,
             vec![],
             "owner".to_string(),
-            "tet".to_string(),
+            "tet".to_string(), Battle::Versus,
         );
         game.add_player_to_room(room_id, guest, "guest".to_string(), "tet".to_string())
             .expect("guest joins");
@@ -1399,7 +1692,7 @@ mod tests {
             false,
             vec![],
             "owner".to_string(),
-            "tet".to_string(),
+            "tet".to_string(), Battle::Versus,
         );
 
         // 未知キーが混ざっていても既知キーだけ保存され、エラーにはならない
@@ -1414,5 +1707,279 @@ mod tests {
         let saved_value: serde_json::Value = serde_json::from_str(&saved).unwrap();
         assert_eq!(saved_value.get("setTarget").unwrap(), 2);
         assert!(saved_value.get("someFutureKey").is_none());
+    }
+
+    // ── ZONE BATTLE ONLINE（設計 tetlabo-zone-online-design.md §3〜§7）──────────────
+
+    fn zone_room(game: &mut Game, owner: Uuid) -> Uuid {
+        let (room_id, _) = game.new_room(
+            owner, "zone".to_string(), 4, true, vec![], "owner".to_string(), "puyo".to_string(), Battle::Zone,
+        );
+        room_id
+    }
+
+    fn stats(score: u32) -> Vec<u8> {
+        // rule(0=tet) + score(u32 LE) + lines + chainMax + attackSent + activeMs（StatsUpdate の中身）
+        let mut v = vec![0u8];
+        v.extend_from_slice(&score.to_le_bytes());
+        v.extend_from_slice(&[0; 10]);
+        v
+    }
+
+    #[test]
+    fn zone_room_has_its_own_default_and_kind() {
+        let mut game = Game::default();
+        let owner = Uuid::new_v4();
+        let zone = zone_room(&mut game, owner);
+        let room = &game.rooms[&zone];
+        assert_eq!(room.battle, Battle::Zone);
+        assert_eq!(room.battle.as_str(), "zone");
+        assert_eq!(room.match_setting, ONLINE_DEFAULT_ZONE_MATCH_SETTING);
+        // 作成者もテト
+        assert_eq!(room.players[0].2, "tet");
+        // 既定の設定は自分の検査を通る（クライアントとの手合わせの確認）
+        assert_eq!(
+            sanitize_match_setting(ONLINE_DEFAULT_ZONE_MATCH_SETTING, Battle::Zone).map(|s| s.len() > 0),
+            Ok(true)
+        );
+        let other = Uuid::new_v4();
+        let (versus, _) = game.new_room(
+            other, "vs".to_string(), 2, true, vec![], "o".to_string(), "puyo".to_string(), Battle::Versus,
+        );
+        assert_eq!(game.rooms[&versus].battle, Battle::Versus);
+        assert_eq!(game.rooms[&versus].players[0].2, "puyo");
+        assert_eq!(Battle::from_wire(None), Battle::Versus);
+        assert_eq!(Battle::from_wire(Some("zone")), Battle::Zone);
+        assert_eq!(Battle::from_wire(Some("??")), Battle::Versus);
+    }
+
+    #[test]
+    fn zone_room_is_tet_only() {
+        let mut game = Game::default();
+        let owner = Uuid::new_v4();
+        let room_id = zone_room(&mut game, owner);
+        // コードで入る人はふだんのルール（ぷよ）で来ても、テトで入る
+        let p = Uuid::new_v4();
+        game.add_player_to_room(room_id, p, "p".to_string(), "puyo".to_string()).unwrap();
+        assert_eq!(game.rooms[&room_id].players[1].2, "tet");
+        // ぷよへの変更は断る・テトは通す
+        assert!(game.update_player_rule(&p, "puyo".to_string()).is_err());
+        assert!(game.update_player_rule(&p, "tet".to_string()).is_ok());
+        assert_eq!(game.rooms[&room_id].players[1].2, "tet");
+    }
+
+    #[test]
+    fn random_match_is_versus_only() {
+        let mut game = Game::default();
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        assert!(matches!(game.random_match(a, "a".to_string(), "tet".to_string()), MatchResult::Waiting));
+        match game.random_match(b, "b".to_string(), "tet".to_string()) {
+            MatchResult::Matched { room_id, .. } => {
+                assert_eq!(game.rooms[&room_id].battle, Battle::Versus);
+                assert_eq!(game.rooms[&room_id].match_setting, ONLINE_DEFAULT_MATCH_SETTING);
+            }
+            _ => panic!("expected a match"),
+        }
+    }
+
+    #[test]
+    fn zone_match_setting_is_validated() {
+        let ok = |s: &str| sanitize_match_setting(s, Battle::Zone);
+        // 知らないキー・VERSUS だけのキーは捨てる
+        let out = ok(r#"{"ojamaRate":70,"foo":1,"zoneSplit":false}"#).unwrap();
+        assert_eq!(out, r#"{"zoneSplit":false}"#);
+        // 選択肢の外は断る
+        assert!(ok(r#"{"marginTime":100}"#).is_err());
+        assert!(ok(r#"{"marginTime":-96}"#).is_ok());
+        assert!(ok(r#"{"marginScore":30000}"#).is_err());
+        assert!(ok(r#"{"marginScore":200000}"#).is_ok());
+        assert!(ok(r#"{"marginTrigger":"later"}"#).is_err());
+        assert!(ok(r#"{"phaseTrigger":"time"}"#).is_ok());
+        assert!(ok(r#"{"garbageHoleRate":75}"#).is_err());
+        assert!(ok(r#"{"garbageHoleChunk":0}"#).is_ok());
+        assert!(ok(r#"{"zoneQuarterMs":6000}"#).is_err());
+        assert!(ok(r#"{"zoneQuarterLines":12}"#).is_ok());
+        assert!(ok(r#"{"garbageMultiplier":3.5}"#).is_err());
+        assert!(ok(r#"{"marginEnabled":1}"#).is_err());
+        // フェーズの表: 3 行・01 のしきい値は 0・行の中の知らないキーは捨てる
+        let row = |s: u32, t: u32| format!(r#"{{"holeRate":90,"holeChunk":10,"zoneTime":4000,"zoneCharge":8,"scoreAdd":{s},"timeAdd":{t},"x":1}}"#);
+        let table = |a: String, b: String, c: String| format!(r#"{{"phaseTable":[{a},{b},{c}]}}"#);
+        let good = ok(&table(row(0, 0), row(20000, 64000), row(40000, 128000))).unwrap();
+        assert!(!good.contains("\"x\""));
+        assert!(ok(&table(row(10000, 0), row(20000, 64000), row(40000, 128000))).is_err());
+        assert!(ok(&table(row(0, 0), row(25000, 64000), row(40000, 128000))).is_err());
+        assert!(ok(&table(row(0, 0), row(20000, 64000), row(40000, 100000))).is_err());
+        assert!(ok(r#"{"phaseTable":[]}"#).is_err());
+        // VERSUS の部屋にも MARGIN の ON/OFF（真偽値のみ）
+        assert_eq!(
+            sanitize_match_setting(r#"{"marginEnabled":false,"marginTime":0}"#, Battle::Versus).unwrap(),
+            r#"{"marginEnabled":false,"marginTime":0}"#
+        );
+        assert!(sanitize_match_setting(r#"{"marginEnabled":"no"}"#, Battle::Versus).is_err());
+        assert!(sanitize_match_setting(ONLINE_DEFAULT_MATCH_SETTING, Battle::Versus).unwrap().contains(r#""marginEnabled":true"#));
+        // VERSUS の部屋は従来どおり（ZONE のキーは捨てる）
+        let vs = sanitize_match_setting(r#"{"zoneSplit":true,"marginTime":100}"#, Battle::Versus).unwrap();
+        assert_eq!(vs, r#"{"marginTime":100}"#);
+    }
+
+    #[test]
+    fn update_match_setting_uses_room_kind() {
+        let mut game = Game::default();
+        let owner = Uuid::new_v4();
+        let room_id = zone_room(&mut game, owner);
+        // ZONE の部屋では MARGIN TIME は 32 秒刻みだけ
+        assert!(game.update_match_setting(&owner, room_id, r#"{"marginTime":100}"#.to_string()).is_err());
+        let saved = game
+            .update_match_setting(&owner, room_id, r#"{"marginTime":128,"phaseTrigger":"time"}"#.to_string())
+            .unwrap();
+        assert_eq!(saved, r#"{"marginTime":128,"phaseTrigger":"time"}"#);
+    }
+
+    fn zone_garbage(target: u8, flags: u8, holes: &[u8]) -> Vec<u8> {
+        let mut v = vec![GARBAGE_PROTOCOL_VERSION_ZONE, target, flags];
+        v.extend_from_slice(&(holes.len() as u16).to_le_bytes());
+        v.extend_from_slice(holes);
+        v
+    }
+
+    #[test]
+    fn garbage_v3_carries_zone_flags() {
+        assert!(validate_garbage_payload(&zone_garbage(1, 0, &[0, 0, 0]), "tet").is_ok());
+        assert!(validate_garbage_payload(&zone_garbage(1, 0b11, &[0; 4]), "tet").is_ok());
+        assert!(validate_garbage_payload(&zone_garbage(1, 0b01, &[0]), "tet").is_ok());
+        // 知らない印・ぷよ向けの印は断る
+        assert!(validate_garbage_payload(&zone_garbage(1, 0b100, &[0]), "tet").is_err());
+        assert!(validate_garbage_payload(&zone_garbage(2, 0b01, &[0]), "puyo").is_err());
+        assert!(validate_garbage_payload(&zone_garbage(2, 0, &[5]), "puyo").is_ok());
+        // 長さぴったり（1 バイト多い・少ないは断る）
+        let mut long = zone_garbage(1, 0, &[0, 0]);
+        long.push(0);
+        assert!(validate_garbage_payload(&long, "tet").is_err());
+        let mut short = zone_garbage(1, 0, &[0, 0]);
+        short.pop();
+        assert!(validate_garbage_payload(&short, "tet").is_err());
+        assert_eq!(garbage_target_rule(&zone_garbage(1, 3, &[0])), Ok(Some("tet")));
+        assert_eq!(garbage_target_rule(&zone_garbage(2, 0, &[0])), Ok(Some("puyo")));
+        // 印の位置を読む前に切れているもの
+        assert!(validate_garbage_payload(&[GARBAGE_PROTOCOL_VERSION_ZONE, 1], "tet").is_err());
+    }
+
+    #[test]
+    fn zone_state_opcode_is_known() {
+        assert!(crate::payload::Opcode::try_from(0x2Cu8).is_ok());
+    }
+
+    fn start_zone_match(game: &mut Game, owner: Uuid, others: &[Uuid], setting: Option<&str>) -> Uuid {
+        let room_id = zone_room(game, owner);
+        for (i, p) in others.iter().enumerate() {
+            game.add_player_to_room(room_id, *p, format!("p{i}"), "tet".to_string()).unwrap();
+        }
+        if let Some(s) = setting {
+            game.update_match_setting(&owner, room_id, s.to_string()).unwrap();
+        }
+        for p in others {
+            game.set_ready(p, true).unwrap();
+        }
+        game.start_match(room_id).unwrap();
+        room_id
+    }
+
+    #[test]
+    fn zone_phase_follows_the_max_score_of_everyone() {
+        let mut game = Game::default();
+        let owner = Uuid::new_v4();
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let room_id = start_zone_match(&mut game, owner, &[a, b], None);
+        assert!(game.in_zone_match(&a));
+        // 既定: 02 = 20,000、03 = 60,000（PHASE TRIGGER: SCORE）。マージンは TIME なので段階は通知しない
+        assert_eq!(game.record_zone_score(&a, &stats(19_999)), None);
+        assert_eq!(game.record_zone_score(&b, &stats(20_000)), Some((room_id, 2, None)));
+        // 同じフェーズのままなら通知しない・下がらない
+        assert_eq!(game.record_zone_score(&owner, &stats(30_000)), None);
+        assert_eq!(game.record_zone_score(&a, &stats(25_000)), None);
+        // 脱落した人のスコアも数える
+        game.record_game_over(&b);
+        assert_eq!(game.record_zone_score(&b, &stats(60_000)), Some((room_id, 3, None)));
+        assert_eq!(game.record_zone_score(&a, &stats(90_000)), None);
+        assert_eq!(game.rooms[&room_id].zone.max_score, 90_000);
+    }
+
+    #[test]
+    fn zone_phase_can_jump_two_steps_and_resets_each_match() {
+        let mut game = Game::default();
+        let owner = Uuid::new_v4();
+        let a = Uuid::new_v4();
+        let room_id = start_zone_match(&mut game, owner, &[a], None);
+        assert_eq!(game.record_zone_score(&a, &stats(70_000)), Some((room_id, 3, None)));
+        // 決着 → 次の試合の頭で 0 に戻る
+        game.record_game_over(&owner);
+        assert!(game.record_zone_score(&a, &stats(80_000)).is_none()); // 対戦中でない
+        assert!(!game.in_zone_match(&a));
+        game.end_post_match(&room_id);
+        game.set_ready(&a, true).unwrap();
+        game.start_match(room_id).unwrap();
+        assert_eq!(game.rooms[&room_id].zone.phase, 1);
+        assert_eq!(game.rooms[&room_id].zone.max_score, 0);
+        assert_eq!(game.record_zone_score(&a, &stats(20_000)), Some((room_id, 2, None)));
+    }
+
+    #[test]
+    fn zone_margin_score_steps_and_custom_thresholds() {
+        let mut game = Game::default();
+        let owner = Uuid::new_v4();
+        let a = Uuid::new_v4();
+        // しきい値は「前のフェーズに足す」: 02 = 30,000、03 = 30,000 + 60,000。マージンは 40,000 で突入・20,000 ごと
+        let setting = r#"{"marginEnabled":true,"marginTrigger":"score","marginScore":40000,"phaseTable":[{"scoreAdd":0},{"scoreAdd":30000},{"scoreAdd":60000}]}"#;
+        let room_id = start_zone_match(&mut game, owner, &[a], Some(setting));
+        assert_eq!(game.record_zone_score(&a, &stats(29_999)), None);
+        assert_eq!(game.record_zone_score(&a, &stats(30_000)), Some((room_id, 2, None)));
+        assert_eq!(game.record_zone_score(&a, &stats(40_000)), Some((room_id, 2, Some(0))));
+        assert_eq!(game.record_zone_score(&a, &stats(59_999)), None);
+        assert_eq!(game.record_zone_score(&owner, &stats(90_000)), Some((room_id, 3, Some(2))));
+        // 段階の上限は 5
+        assert_eq!(game.record_zone_score(&a, &stats(500_000)), Some((room_id, 3, Some(5))));
+        assert_eq!(game.record_zone_score(&a, &stats(600_000)), None);
+    }
+
+    #[test]
+    fn zone_progress_is_quiet_for_time_triggers_and_versus_rooms() {
+        let mut game = Game::default();
+        let owner = Uuid::new_v4();
+        let a = Uuid::new_v4();
+        // PHASE TRIGGER: TIME・MARGIN TRIGGER: TIME → サーバーは通知しない（各クライアントの時計）
+        start_zone_match(&mut game, owner, &[a], Some(r#"{"phaseTrigger":"time"}"#));
+        assert_eq!(game.record_zone_score(&a, &stats(500_000)), None);
+        // PHASE OFF も同じ
+        let mut game = Game::default();
+        start_zone_match(&mut game, owner, &[a], Some(r#"{"phase":false}"#));
+        assert_eq!(game.record_zone_score(&a, &stats(500_000)), None);
+        // MARGIN SCORE 0（即時）は始まりから段階 0（クライアントも同じなので通知しない）
+        let mut game = Game::default();
+        let room_id = start_zone_match(&mut game, owner, &[a], Some(r#"{"phase":false,"marginTrigger":"score","marginScore":0}"#));
+        assert_eq!(game.rooms[&room_id].zone.margin_step, Some(0));
+        assert_eq!(game.record_zone_score(&a, &stats(19_999)), None);
+        assert_eq!(game.record_zone_score(&a, &stats(20_000)), Some((room_id, 1, Some(1))));
+        // MARGIN OFF なら SCORE でも通知しない
+        let mut game = Game::default();
+        start_zone_match(&mut game, owner, &[a], Some(r#"{"phase":false,"marginEnabled":false,"marginTrigger":"score"}"#));
+        assert_eq!(game.record_zone_score(&a, &stats(500_000)), None);
+        // VERSUS の部屋は読まない
+        let mut game = Game::default();
+        let (vs, _) = game.new_room(
+            owner, "vs".to_string(), 2, true, vec![], "o".to_string(), "tet".to_string(), Battle::Versus,
+        );
+        game.add_player_to_room(vs, a, "a".to_string(), "tet".to_string()).unwrap();
+        game.set_ready(&a, true).unwrap();
+        game.start_match(vs).unwrap();
+        assert_eq!(game.record_zone_score(&a, &stats(500_000)), None);
+        // ぷよの StatsUpdate（rule=1）・短い中身は読まない
+        let mut game = Game::default();
+        start_zone_match(&mut game, owner, &[a], None);
+        let mut puyo = stats(500_000);
+        puyo[0] = 1;
+        assert_eq!(game.record_zone_score(&a, &puyo), None);
+        assert_eq!(game.record_zone_score(&a, &[0, 1, 2]), None);
     }
 }

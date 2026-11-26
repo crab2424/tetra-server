@@ -58,11 +58,14 @@ const ROOM_SWEEP_INTERVAL_SECS: u64 = 60;
 ///   3. 相手に影響する対戦ルール(おじゃまの計算・相殺など)
 /// それ以外の変更(見た目・PRACTICE・シングルの修正など)では上げない＝サーバー再デプロイ不要。
 ///
-/// 直近の変更(2→3): テトのおじゃまの穴を受ける側が着弾時に決める規則に変更(対戦ルール)、
+/// 直近の変更(3→4): ZONE BATTLE ONLINE（設計 tetlabo-zone-online-design.md）。部屋の種類 battle、
+/// ZONE BATTLE の部屋設定、Garbage 版 3（ZONE の印）、0x2C ZoneState、フェーズ・マージン段階の通知
+/// （JSONZonePhaseNotification）を追加（クライアント v2.7.0）。
+/// (2→3): テトのおじゃまの穴を受ける側が着弾時に決める規則に変更(対戦ルール)、
 /// あわせて Garbage フレームを v2(宛先ルール付き)に変更（クライアント v2.4.0）。
 /// (1→2): online アカウント化(設計 v2.2.2 §7.4)。Auth/AuthResult/Offer と
 /// RoomInfoNotification のフィールドを追加したため。
-const PROTOCOL_VERSION: u32 = 3;
+const PROTOCOL_VERSION: u32 = 4;
 
 /// 接続を受理するプロトコル番号の一覧（互換ウィンドウ）。
 /// サーバーは常にクライアントより先に本番へデプロイされる（クライアントのリリースはPR経由で
@@ -79,7 +82,8 @@ const PROTOCOL_VERSION: u32 = 3;
 /// 3 は破壊的変更（穴の決め方が送る側→受ける側。部屋をプロトコル番号で分ける仕組みが無く、
 /// 旧規則のクライアントと同じ部屋で混ざるため）。1・2 は締め出し、クライアント v2.4.0 の
 /// 公開と同時にデプロイする（旧版はリロードで新版になる）。
-const SUPPORTED_PROTOCOL_VERSIONS: &[u32] = &[3];
+/// 4 も破壊的変更（Garbage の版・部屋の形が変わる）。3 は締め出し、クライアント v2.7.0 の公開と同時にデプロイする。
+const SUPPORTED_PROTOCOL_VERSIONS: &[u32] = &[4];
 
 /// 認証判定を接続処理から切り出したもの（単体テスト用）。
 /// `protocol` が SUPPORTED_PROTOCOL_VERSIONS に含まれるときだけ許可する。
@@ -845,6 +849,8 @@ mod tests {
         // 旧規則のクライアント(protocol 1/2)は同じ部屋で混ざらないよう締め出す。
         assert!(check_auth(Some(1)).is_err());
         assert!(check_auth(Some(2)).is_err());
+        // protocol 4（ZONE BATTLE ONLINE。Garbage 版 3・部屋の種類）で 3 も締め出す
+        assert!(check_auth(Some(3)).is_err());
     }
 
     #[test]

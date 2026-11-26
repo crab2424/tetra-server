@@ -5,7 +5,7 @@ use tracing::{debug, error, info};
 
 use crate::connection::common::{
     broadcast_json, broadcast_leave_result, disconnect_player, notify_room, relay_match_frame,
-    spawn_close_channels, spawn_send_reattach_state,
+    room_info_notification, spawn_close_channels, spawn_send_reattach_state,
 };
 use crate::game::{Game, MatchResult, WinnerStatus};
 use crate::payload;
@@ -68,7 +68,8 @@ pub async fn handle_reliable_connection(
 
             // ゲームデータは opcode ごとにチャネルを固定する。Garbage だけは
             // 相手ルール・対戦状態・payload をサーバー側で検証してから中継する。
-            if data[0] >= 0x20 && data[0] <= 0x2B {
+            // 0x2C = ZoneState（PROTOCOL 4。相手に ZONE を見せるだけ。中身は見ない）
+            if data[0] >= 0x20 && data[0] <= 0x2C {
                 if data[0] == payload::Opcode::PieceStatePayload as u8 {
                     error!("PieceState received on reliable channel from player {id}");
                     return;
@@ -93,10 +94,32 @@ pub async fn handle_reliable_connection(
                         error!("Failed to relay match frame 0x{:02X}: {e}", data[0]);
                     }
                 }
+                // ZONE BATTLE: StatsUpdate の中継のついでにスコアを読み、部屋の全員のスコアの最大値で
+                // フェーズ・SCORE のマージンが上がったら全員へ一斉に通知する（設計 §5）
+                // （VERSUS の部屋では書き込みロックを取らない）
+                if data[0] == payload::Opcode::StatsUpdatePayload as u8
+                    && game.read().await.in_zone_match(&id)
+                {
+                    let up = game.write().await.record_zone_score(&id, &data[1..]);
+                    if let Some((room_id, phase, margin_step)) = up {
+                        broadcast_json(
+                            &game,
+                            room_id,
+                            &payload::JsonMessage::JSONZonePhaseNotification(
+                                payload::JSONZonePhaseNotification {
+                                    room_id,
+                                    phase,
+                                    margin_step,
+                                },
+                            ),
+                        )
+                        .await;
+                    }
+                }
                 return;
             }
 
-            if data[0] >= 0x2C && data[0] <= 0x3F {
+            if data[0] >= 0x2D && data[0] <= 0x3F {
                 error!("Unknown game opcode on reliable channel: 0x{:02X}", data[0]);
                 return;
             }
@@ -206,6 +229,7 @@ pub async fn handle_reliable_connection(
                                         max_players: raw_room.max_players,
                                         locked: false,
                                         tags: raw_room.tags.iter().map(|tag| *tag as u32).collect(),
+                                        battle: raw_room.battle.as_str().to_string(),
                                     })
                                     .collect();
                                 let (online_count, in_match_count, matching_count) =
@@ -227,6 +251,7 @@ pub async fn handle_reliable_connection(
                                 let is_public = req.is_public;
                                 let username = req.username;
                                 let rule = req.rule;
+                                let battle = crate::room::Battle::from_wire(req.battle.as_deref());
                                 let tags = req
                                     .tags
                                     .into_iter()
@@ -252,6 +277,7 @@ pub async fn handle_reliable_connection(
                                     tags,
                                     username,
                                     rule,
+                                    battle,
                                 );
 
                                 jsend!(
@@ -527,28 +553,9 @@ pub async fn handle_reliable_connection(
                                 let room_id_opt = game.room_of(&id);
                                 match room_id_opt {
                                     Some(room_id) => {
-                                        let room = match game.rooms.get(&room_id) {
-                                            Some(r) => r,
-                                            None => {
-                                                error!("Room not found for RoomInfoNotificationRequest: {room_id}");
-                                                return;
-                                            }
-                                        };
-                                        let owner_id = room.owner;
-                                        let accounts = game.room_accounts(&room_id);
-                                        let notif = payload::JSONRoomInfoNotification {
-                                            room_id,
-                                            owner_id,
-                                            room_name: room.room_name.clone(),
-                                            players: room.players.clone(),
-                                            max_players: room.max_players,
-                                            tags: room.tags.iter().map(|t| *t as u32).collect(),
-                                            match_setting: room.match_setting.clone(),
-                                            ready_players: room.ready_players.clone(),
-                                            pings: room.pings.iter().map(|(pid, ms)| (*pid, *ms)).collect(),
-                                            code: room.code.clone(),
-                                            is_public: room.is_public,
-                                            accounts,
+                                        let Some(notif) = room_info_notification(&game, room_id) else {
+                                            error!("Room not found for RoomInfoNotificationRequest: {room_id}");
+                                            return;
                                         };
                                         jsend!(dc_clone, JSONRoomInfoNotification { ..notif });
                                     }

@@ -80,6 +80,8 @@ pub struct ListRoomInfo {
     pub max_players: u8,
     pub locked: bool,
     pub tags: Vec<u32>,
+    /// 部屋の種類 "versus" | "zone"（PROTOCOL 4。一覧の絞り込みに使う）
+    pub battle: String,
 }
 
 json_message!(
@@ -88,7 +90,7 @@ json_message!(
         Pong, (id, Uuid);
         GetRoomsRequest, (id, Uuid);
         GetRoomsResponse, (id, Uuid), (rooms, Vec<ListRoomInfo>), (online_count, u32), (in_match_count, u32), (matching_count, u32);
-        CreateRoomRequest, (id, Uuid), (room_name, String), (max_players, u8), (is_public, bool), (tags, Vec<u32>), (username, String), (rule, String);
+        CreateRoomRequest, (id, Uuid), (room_name, String), (max_players, u8), (is_public, bool), (tags, Vec<u32>), (username, String), (rule, String), (battle, Option<String>);
         CreateRoomResponse, (id, Uuid), (room_id, Uuid), (code, String);
         JoinRoomRequest, (id, Uuid), (room_id, Uuid), (username, String), (rule, String);
         JoinRoomResponse, (id, Uuid), (success, bool), (message, Option<String>);
@@ -103,7 +105,7 @@ json_message!(
         UpdateRoomRequest, (id, Uuid), (room_id, Uuid), (room_name, String), (max_players, u8), (is_public, bool), (tags, Vec<u32>);
         UpdateRoomResponse, (id, Uuid), (success, bool), (message, Option<String>);
         RoomInfoNotificationRequest, (id, Uuid);
-        RoomInfoNotification, (room_id, Uuid), (owner_id, Uuid), (room_name, String), (players, Vec<(Uuid, String, String)>), (max_players, u8), (tags, Vec<u32>), (match_setting, String), (ready_players, Vec<Uuid>), (pings, Vec<(Uuid, u32)>), (code, String), (is_public, bool), (accounts, Vec<(Uuid, String, String)>);
+        RoomInfoNotification, (room_id, Uuid), (owner_id, Uuid), (room_name, String), (players, Vec<(Uuid, String, String)>), (max_players, u8), (tags, Vec<u32>), (match_setting, String), (ready_players, Vec<Uuid>), (pings, Vec<(Uuid, u32)>), (code, String), (is_public, bool), (accounts, Vec<(Uuid, String, String)>), (battle, String);
         SetReadyRequest, (id, Uuid), (room_id, Uuid), (ready, bool);
         SetReadyResponse, (id, Uuid), (success, bool), (message, Option<String>);
         TimeSyncRequest, (id, Uuid);
@@ -132,6 +134,10 @@ json_message!(
         PlayerDisconnectedNotification, (room_id, Uuid), (player_id, Uuid);
         PlayerConnectionLostNotification, (room_id, Uuid), (player_id, Uuid), (grace_ms, u64);
         PlayerReconnectedNotification, (room_id, Uuid), (player_id, Uuid);
+        // ── ZONE BATTLE（設計 tetlabo-zone-online-design.md §5・§6.4）────────────
+        // 部屋の全員のスコアの最大値でフェーズ（1〜3）・SCORE のマージンの段階（未突入は null）が
+        // 上がったとき、部屋の全員へ送る。受けた側は届いた時点で入れる
+        ZonePhaseNotification, (room_id, Uuid), (phase, u8), (margin_step, Option<u8>);
     }
 );
 
@@ -140,5 +146,53 @@ impl JsonMessage {
         let data = serde_json::to_string(self)?;
         let payload = JSONResponsePayload { data };
         Ok(payload.to_binary()?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// クライアント（src/online/payload.ts isZonePhaseNotification / ZonePhaseNotification）が読む形
+    #[test]
+    fn zone_phase_notification_wire_shape() {
+        let room_id = Uuid::nil();
+        let msg = JsonMessage::JSONZonePhaseNotification(JSONZonePhaseNotification {
+            room_id,
+            phase: 2,
+            margin_step: None,
+        });
+        let v: serde_json::Value = serde_json::to_value(&msg).unwrap();
+        assert_eq!(v["type"], "JSONZonePhaseNotification");
+        assert_eq!(v["roomId"], room_id.to_string());
+        assert_eq!(v["phase"], 2);
+        assert!(v["marginStep"].is_null());
+        let msg = JsonMessage::JSONZonePhaseNotification(JSONZonePhaseNotification {
+            room_id,
+            phase: 3,
+            margin_step: Some(1),
+        });
+        assert_eq!(serde_json::to_value(&msg).unwrap()["marginStep"], 1);
+    }
+
+    /// 作成要求の battle は省略できる（無ければ VERSUS）。部屋情報・一覧には battle が入る
+    #[test]
+    fn create_room_battle_is_optional() {
+        let req: JsonMessage = serde_json::from_str(
+            r#"{"type":"JSONCreateRoomRequest","id":"00000000-0000-0000-0000-000000000000","roomName":"a","maxPlayers":2,"isPublic":true,"tags":[],"username":"u","rule":"tet"}"#,
+        )
+        .unwrap();
+        match req {
+            JsonMessage::JSONCreateRoomRequest(r) => assert!(r.battle.is_none()),
+            _ => panic!("unexpected message"),
+        }
+        let req: JsonMessage = serde_json::from_str(
+            r#"{"type":"JSONCreateRoomRequest","id":"00000000-0000-0000-0000-000000000000","roomName":"a","maxPlayers":2,"isPublic":true,"tags":[],"username":"u","rule":"tet","battle":"zone"}"#,
+        )
+        .unwrap();
+        match req {
+            JsonMessage::JSONCreateRoomRequest(r) => assert_eq!(r.battle.as_deref(), Some("zone")),
+            _ => panic!("unexpected message"),
+        }
     }
 }
